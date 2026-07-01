@@ -10,6 +10,7 @@ from src.a_share_research.market_data_service import (
     StaticMarketDataProvider,
     TencentMarketDataProvider,
     classify_bid_ask_actionability,
+    create_app,
     normalize_stock_code,
 )
 
@@ -207,3 +208,15 @@ def test_market_snapshot_partial_fallback_uses_json_safe_nulls() -> None:
     assert out["freshness"] == "partial_live"
     assert out["data"]["breadth_available"] is False
     assert out["data"]["indices"][0]["turnover_rate"] is None
+
+
+def test_privacy_endpoint_returns_plain_policy_page() -> None:
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(service=MarketDataService(provider=StaticMarketDataProvider())))
+
+    response = client.get("/privacy")
+
+    assert response.status_code == 200
+    assert "A股实时持仓分析助手隐私政策" in response.text
+    assert "不要求用户提供 API key" in response.text

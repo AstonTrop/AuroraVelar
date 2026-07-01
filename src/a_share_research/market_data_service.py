@@ -562,6 +562,7 @@ class MarketDataService:
 def create_app(service: MarketDataService | None = None):
     try:
         from fastapi import FastAPI, Query  # noqa: PLC0415
+        from fastapi.responses import HTMLResponse  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("FastAPI is required to run the HTTP server. Install requirements.txt first.") from exc
 
@@ -571,6 +572,27 @@ def create_app(service: MarketDataService | None = None):
     @app.get("/health")
     def health():
         return service.health()
+
+    @app.get("/privacy", response_class=HTMLResponse)
+    def privacy():
+        return """
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <title>A股实时持仓分析助手隐私政策</title>
+        </head>
+        <body>
+          <h1>A股实时持仓分析助手隐私政策</h1>
+          <p>本服务用于为自定义 GPT 提供 A 股行情、盘口、技术分析和持仓辅助分析接口。</p>
+          <p>本服务不要求用户提供 API key、券商账户、交易密码或其他敏感身份凭据。</p>
+          <p>请求中可能包含用户主动输入的股票代码、持仓股数、可卖股数、成本价和现金余额，用于生成当次分析结果。</p>
+          <p>本服务不会代替用户下单，不会连接券商账户，也不会执行真实交易。</p>
+          <p>行情数据来自公开网络数据源，分析结果仅供研究参考，不构成投资建议或收益承诺。</p>
+          <p>如需删除或停止使用，请在 ChatGPT 中移除该自定义 GPT 或删除其 Actions 配置。</p>
+        </body>
+        </html>
+        """
 
     @app.get("/market/snapshot")
     def market_snapshot():
