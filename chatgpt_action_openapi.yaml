@@ -98,6 +98,41 @@ paths:
       responses:
         "200":
           description: 过滤ST、科创、涨停封板、现金不足后的候选股
+  /candidates/verify:
+    post:
+      operationId: verifyCandidates
+      summary: 核验由ChatGPT或用户提供的候选股票
+      description: 对候选股票逐只核验实时价格、盘口可执行性、技术点位、现金约束、主板范围和追高风险，用于判断是否值得推荐。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cash:
+                  type: number
+                  description: 当前可用现金，用于判断是否买得起一手
+                candidates:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                        description: 股票代码，例如 000725
+                      name:
+                        type: string
+                        description: 股票名称
+                      source_reason:
+                        type: string
+                        description: ChatGPT或用户提出该候选的原因，例如板块异动、新闻催化、涨幅榜等
+              required:
+                - cash
+                - candidates
+      responses:
+        "200":
+          description: 每只候选的实时核验结果、买卖止损点和最终推荐评级
   /portfolio/analyze:
     post:
       operationId: analyzePortfolio

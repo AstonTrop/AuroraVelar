@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 
 from src.a_share_research.market_data_service import (
+    CloudMarketDataProvider,
     EastmoneyDirectMarketDataProvider,
     FallbackMarketDataProvider,
     MarketDataService,
@@ -143,6 +144,66 @@ def test_actionable_candidates_rejects_new_stock_and_overheated_gain() -> None:
     rejected = {item["code"]: item["reason"] for item in out["data"]["rejected"]}
     assert rejected["001399"] == "新股/次新波动过大"
     assert rejected["000001"] == "涨幅过高不追"
+
+
+def test_verify_candidates_scores_chatgpt_candidates_without_full_market_scan() -> None:
+    class CandidateProvider(StaticMarketDataProvider):
+        def quotes(self) -> pd.DataFrame:
+            raise AssertionError("candidate verification should not scan the full market")
+
+        def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+            normalized = {str(code).zfill(6) for code in codes}
+            return self.quotes_df[self.quotes_df["代码"].isin(normalized)].copy()
+
+    provider = CandidateProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "000725", "名称": "京东方A", "最新价": 8.7, "涨跌幅": 2.0},
+                {"代码": "688001", "名称": "科创X", "最新价": 18.0, "涨跌幅": 1.0},
+                {"代码": "000001", "名称": "高涨幅A", "最新价": 6.0, "涨跌幅": 9.8},
+            ]
+        ),
+        bidasks={
+            "000725": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 8.7},
+                    {"item": "涨幅", "value": 2.0},
+                    {"item": "sell_1", "value": 8.71},
+                    {"item": "buy_1", "value": 8.7},
+                ]
+            ),
+            "000001": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 6.0},
+                    {"item": "涨幅", "value": 9.8},
+                    {"item": "sell_1", "value": 6.01},
+                    {"item": "buy_1", "value": 6.0},
+                ]
+            ),
+        },
+        hist={
+            "000725": pd.DataFrame({"收盘": [5 + i * 0.05 for i in range(80)]}),
+        },
+    )
+
+    out = MarketDataService(provider=provider).verify_candidates(
+        {
+            "cash": 5000,
+            "candidates": [
+                {"code": "000725", "name": "京东方A", "source_reason": "面板板块异动"},
+                {"code": "688001", "name": "科创X", "source_reason": "AI找到的候选"},
+                {"code": "000001", "name": "高涨幅A", "source_reason": "涨幅榜"},
+            ],
+        }
+    )
+
+    verdicts = {item["code"]: item["verdict"] for item in out["data"]["results"]}
+    assert verdicts["000725"] == "可重点观察"
+    assert verdicts["688001"] == "不建议买入"
+    assert verdicts["000001"] == "不建议买入"
+    reasons = {item["code"]: item["decision_reasons"] for item in out["data"]["results"]}
+    assert "非主板或代码无效" in reasons["688001"]
+    assert "涨幅过高，不适合追高" in reasons["000001"]
 
 
 def test_technical_endpoint_returns_trade_points() -> None:
@@ -292,6 +353,92 @@ def test_sina_provider_parses_daily_hist() -> None:
 
     assert list(hist["收盘"]) == [10.2, 10.6]
     assert list(hist["日期"]) == ["2026-06-29", "2026-06-30"]
+
+
+def test_fallback_provider_uses_fallback_when_boards_empty() -> None:
+    class EmptyBoards:
+        source = "empty"
+
+        def boards(self) -> pd.DataFrame:
+            return pd.DataFrame()
+
+    fallback = StaticMarketDataProvider(
+        boards_df=pd.DataFrame(
+            [
+                {
+                    "board_type": "行业",
+                    "board_name": "电力行业",
+                    "change_pct": 2.23,
+                    "up_count": 0,
+                    "down_count": 0,
+                    "leader": "上海电力",
+                    "leader_change_pct": 9.95,
+                }
+            ]
+        )
+    )
+    provider = FallbackMarketDataProvider(primary=EmptyBoards(), fallback=fallback)
+
+    boards = provider.boards()
+
+    assert boards.iloc[0]["board_name"] == "电力行业"
+
+
+def test_cloud_provider_routes_methods_to_lightweight_sources() -> None:
+    calls: list[str] = []
+
+    class FullMarket:
+        source = "full"
+
+        def quotes(self) -> pd.DataFrame:
+            calls.append("full.quotes")
+            return pd.DataFrame([{"代码": "000001", "名称": "平安银行", "最新价": 10.0, "涨跌幅": 1.0}])
+
+    class Realtime:
+        source = "realtime"
+
+        def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+            calls.append("realtime.quotes_for")
+            return pd.DataFrame([{"代码": codes[0], "名称": "京东方A", "最新价": 8.7, "涨跌幅": 1.0}])
+
+        def indices(self) -> pd.DataFrame:
+            calls.append("realtime.indices")
+            return pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}])
+
+        def bid_ask(self, code: str) -> pd.DataFrame:
+            calls.append("realtime.bid_ask")
+            return pd.DataFrame([{"item": "最新", "value": 8.7}, {"item": "涨幅", "value": 1.0}])
+
+    class BoardAndHistory:
+        source = "sina-like"
+
+        def boards(self) -> pd.DataFrame:
+            calls.append("sina.boards")
+            return pd.DataFrame([{"board_name": "电力行业", "change_pct": 2.0, "leader": "上海电力"}])
+
+        def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
+            calls.append("sina.hist")
+            return pd.DataFrame({"收盘": [5 + i * 0.05 for i in range(80)]})
+
+    provider = CloudMarketDataProvider(
+        full_market_provider=FullMarket(),
+        realtime_provider=Realtime(),
+        board_provider=BoardAndHistory(),
+        history_provider=BoardAndHistory(),
+    )
+
+    assert provider.quotes_for(["000725"]).iloc[0]["代码"] == "000725"
+    assert provider.indices().iloc[0]["名称"] == "上证指数"
+    assert provider.boards().iloc[0]["board_name"] == "电力行业"
+    assert not provider.hist("000725").empty
+    assert provider.quotes().iloc[0]["代码"] == "000001"
+    assert calls == [
+        "realtime.quotes_for",
+        "realtime.indices",
+        "sina.boards",
+        "sina.hist",
+        "full.quotes",
+    ]
 
 
 def test_default_market_snapshot_uses_direct_breadth_when_akshare_fails() -> None:

@@ -548,14 +548,17 @@ class FallbackMarketDataProvider:
 
     def _with_fallback(self, method: str, *args: Any, **kwargs: Any) -> Any:
         try:
-            return getattr(self.primary, method)(*args, **kwargs)
+            result = getattr(self.primary, method)(*args, **kwargs)
+            if isinstance(result, pd.DataFrame) and result.empty:
+                raise RuntimeError(f"Primary {method} returned empty data")
+            return result
         except Exception:
             return getattr(self.fallback, method)(*args, **kwargs)
 
     def quotes(self) -> pd.DataFrame:
         try:
             quotes = self.primary.quotes()
-            if isinstance(quotes, pd.DataFrame) and 0 < len(quotes) < MIN_FULL_MARKET_ROWS:
+            if isinstance(quotes, pd.DataFrame) and len(quotes) < MIN_FULL_MARKET_ROWS:
                 raise RuntimeError(f"Primary full-market quotes incomplete: {len(quotes)} rows")
             return quotes
         except Exception:
@@ -564,7 +567,9 @@ class FallbackMarketDataProvider:
     def quotes_for(self, codes: list[str]) -> pd.DataFrame:
         if hasattr(self.primary, "quotes_for"):
             try:
-                return self.primary.quotes_for(codes)
+                quotes = self.primary.quotes_for(codes)
+                if isinstance(quotes, pd.DataFrame) and not quotes.empty:
+                    return quotes
             except Exception:
                 pass
         return self.fallback.quotes_for(codes)
@@ -582,17 +587,65 @@ class FallbackMarketDataProvider:
         return self._with_fallback("hist", code, report_date=report_date)
 
 
-def create_default_provider() -> FallbackMarketDataProvider:
-    return FallbackMarketDataProvider(
-        primary=AkshareMarketDataProvider(),
-        fallback=FallbackMarketDataProvider(
+class CloudMarketDataProvider:
+    """Route each endpoint to the lightest reliable public data source."""
+
+    def __init__(
+        self,
+        *,
+        full_market_provider: Any | None = None,
+        realtime_provider: Any | None = None,
+        board_provider: Any | None = None,
+        history_provider: Any | None = None,
+    ) -> None:
+        akshare = AkshareMarketDataProvider()
+        tencent = TencentMarketDataProvider()
+        sina = SinaMarketDataProvider()
+        self.full_market_provider = full_market_provider or FallbackMarketDataProvider(
             primary=EastmoneyDirectMarketDataProvider(),
-            fallback=FallbackMarketDataProvider(
-                primary=SinaMarketDataProvider(),
-                fallback=TencentMarketDataProvider(),
-            ),
-        ),
-    )
+            fallback=sina,
+        )
+        self.realtime_provider = realtime_provider or FallbackMarketDataProvider(
+            primary=tencent,
+            fallback=akshare,
+        )
+        self.board_provider = board_provider or FallbackMarketDataProvider(
+            primary=sina,
+            fallback=akshare,
+        )
+        self.history_provider = history_provider or FallbackMarketDataProvider(
+            primary=sina,
+            fallback=akshare,
+        )
+        sources = [
+            getattr(self.full_market_provider, "source", EASTMONEY_DIRECT_SOURCE),
+            getattr(self.realtime_provider, "source", TENCENT_SOURCE),
+            getattr(self.board_provider, "source", SINA_SOURCE),
+            getattr(self.history_provider, "source", SINA_SOURCE),
+        ]
+        self.source = "+".join(dict.fromkeys(str(source) for source in sources))
+
+    def quotes(self) -> pd.DataFrame:
+        return self.full_market_provider.quotes()
+
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        return self.realtime_provider.quotes_for(codes)
+
+    def indices(self) -> pd.DataFrame:
+        return self.realtime_provider.indices()
+
+    def bid_ask(self, code: str) -> pd.DataFrame:
+        return self.realtime_provider.bid_ask(code)
+
+    def boards(self) -> pd.DataFrame:
+        return self.board_provider.boards()
+
+    def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
+        return self.history_provider.hist(code, report_date=report_date)
+
+
+def create_default_provider() -> CloudMarketDataProvider:
+    return CloudMarketDataProvider()
 
 
 class StaticMarketDataProvider:
@@ -748,6 +801,94 @@ class MarketDataService:
             return self._unavailable(exc)
         return response_envelope({"code": normalize_code(code), **profile}, source=self.source)
 
+    def verify_candidates(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cash = float(payload.get("cash", 0.0) or 0.0)
+        raw_candidates = payload.get("candidates", []) or []
+        codes = [normalize_code(item.get("code", "")) for item in raw_candidates]
+        quotes_out = self.stock_quotes(codes)
+        quotes = {}
+        if quotes_out["freshness"] != "unavailable":
+            quotes = {item["code"]: item for item in quotes_out.get("data", {}).get("quotes", [])}
+        results: list[dict[str, Any]] = []
+        for item in raw_candidates:
+            code = normalize_code(item.get("code", ""))
+            name = str(item.get("name", "") or quotes.get(code, {}).get("name", ""))
+            reasons: list[str] = []
+            if not is_mainboard_code(code):
+                reasons.append("非主板或代码无效")
+            if is_st_name(name) or "退" in name:
+                reasons.append("ST/退市风险标的")
+            if name.strip().upper().startswith(("C", "N")):
+                reasons.append("新股/次新波动过大")
+
+            quote = quotes.get(code, {})
+            latest_price = quote.get("latest_price")
+            day_change_pct = quote.get("day_change_pct")
+            bidask_out = self.stock_bidask(code, cash=cash) if code else self._unavailable(ValueError("missing code"))
+            bidask = bidask_out["data"] if bidask_out["freshness"] != "unavailable" else {}
+            if bidask_out["freshness"] == "unavailable":
+                reasons.append("盘口不可确认")
+            elif bidask.get("actionability") != "可买":
+                reasons.append(str(bidask.get("actionability")))
+            latest = bidask.get("latest_price")
+            change_pct = bidask.get("day_change_pct")
+            if latest is not None and not pd.isna(latest):
+                latest_price = latest
+            if change_pct is not None and not pd.isna(change_pct):
+                day_change_pct = change_pct
+            if latest_price is not None and not pd.isna(latest_price) and float(latest_price) * 100 > cash:
+                reasons.append("现金不足买一手")
+            if day_change_pct is not None and not pd.isna(day_change_pct) and float(day_change_pct) >= 9.5:
+                reasons.append("涨幅过高，不适合追高")
+
+            tech_out = self.technical(code) if code else self._unavailable(ValueError("missing code"))
+            tech = tech_out["data"] if tech_out["freshness"] != "unavailable" else {}
+            if tech_out["freshness"] == "unavailable":
+                reasons.append("技术数据不可确认")
+            technical_score = tech.get("technical_score")
+            if technical_score is not None and technical_score < 45:
+                reasons.append("技术结构偏弱")
+
+            hard_reject = any(
+                reason in reasons
+                for reason in [
+                    "非主板或代码无效",
+                    "ST/退市风险标的",
+                    "新股/次新波动过大",
+                    "现金不足买一手",
+                    "涨停封板不可追",
+                    "跌停风险",
+                    "涨幅过高，不适合追高",
+                ]
+            )
+            if hard_reject:
+                verdict = "不建议买入"
+            elif bidask_out["freshness"] == "unavailable" or tech_out["freshness"] == "unavailable":
+                verdict = "只观察"
+            elif technical_score is not None and technical_score >= 45:
+                verdict = "可重点观察"
+            else:
+                verdict = "只观察"
+            results.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "source_reason": item.get("source_reason"),
+                    "latest_price": latest_price,
+                    "day_change_pct": day_change_pct,
+                    "verdict": verdict,
+                    "decision_reasons": reasons or ["实时约束和技术结构未触发硬性否决"],
+                    "actionability": bidask.get("actionability"),
+                    "min_lot_cost": bidask.get("min_lot_cost"),
+                    "technical_score": technical_score,
+                    "buy_point": tech.get("buy_point"),
+                    "sell_point": tech.get("sell_point"),
+                    "stop_loss_point": tech.get("stop_loss_point"),
+                    "technical_point_sources": tech.get("technical_point_sources"),
+                }
+            )
+        return response_envelope({"results": results}, source=self.source)
+
     def actionable_candidates(self, cash: float, price_limit: float = 20.0, limit: int = 20) -> dict[str, Any]:
         try:
             quotes = normalize_quotes_df(self.provider.quotes())
@@ -901,6 +1042,10 @@ def create_app(service: MarketDataService | None = None):
     @app.get("/candidates/actionable")
     def candidates_actionable(cash: float, price_limit: float = 20.0, limit: int = 20):
         return service.actionable_candidates(cash=cash, price_limit=price_limit, limit=limit)
+
+    @app.post("/candidates/verify")
+    def candidates_verify(payload: dict[str, Any]):
+        return service.verify_candidates(payload)
 
     @app.post("/portfolio/analyze")
     def portfolio_analyze(payload: dict[str, Any]):
