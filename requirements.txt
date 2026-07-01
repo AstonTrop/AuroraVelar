@@ -1,0 +1,8 @@
+akshare
+pandas
+numpy
+plotly
+jinja2
+pytest
+fastapi
+uvicorn[standard]

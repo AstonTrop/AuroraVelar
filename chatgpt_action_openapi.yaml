@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: A Share Market Data Service
+  version: 0.1.0
+  description: 获取A股实时大盘、个股报价、盘口、板块、技术点位和持仓分析数据。
+servers:
+  - url: https://YOUR-DEPLOYED-DOMAIN.example.com
+    description: Replace with your deployed HTTPS service URL
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: 检查行情服务状态
+      responses:
+        "200":
+          description: 服务状态
+  /market/snapshot:
+    get:
+      operationId: getMarketSnapshot
+      summary: 获取实时大盘快照
+      responses:
+        "200":
+          description: 大盘指数、涨跌家数、涨跌停数和市场温度
+  /stock/quotes:
+    get:
+      operationId: getStockQuotes
+      summary: 获取多只股票实时行情
+      parameters:
+        - name: codes
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 逗号分隔的股票代码，例如 000725,600667,600879
+      responses:
+        "200":
+          description: 个股实时行情
+  /stock/bidask:
+    get:
+      operationId: getStockBidAsk
+      summary: 获取个股五档盘口和可执行性
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: cash
+          in: query
+          required: false
+          schema:
+            type: number
+      responses:
+        "200":
+          description: 五档盘口、涨停封板识别和可买状态
+  /boards/hot:
+    get:
+      operationId: getHotBoards
+      summary: 获取热门板块
+      responses:
+        "200":
+          description: 热门行业、概念或异动板块
+  /stock/technical:
+    get:
+      operationId: getStockTechnical
+      summary: 获取个股技术分析点位
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: MA、RSI、MACD、买入点、卖出点、止损点和来源
+  /candidates/actionable:
+    get:
+      operationId: getActionableCandidates
+      summary: 获取可执行候选股
+      parameters:
+        - name: cash
+          in: query
+          required: true
+          schema:
+            type: number
+        - name: price_limit
+          in: query
+          required: false
+          schema:
+            type: number
+            default: 20
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: 过滤ST、科创、涨停封板、现金不足后的候选股
+  /portfolio/analyze:
+    post:
+      operationId: analyzePortfolio
+      summary: 基于实时行情分析持仓
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cash:
+                  type: number
+                positions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      name:
+                        type: string
+                      shares:
+                        type: integer
+                      available:
+                        type: integer
+                      cost:
+                        type: number
+      responses:
+        "200":
+          description: 持仓诊断、T+1约束和操作建议
