@@ -12,7 +12,10 @@ from .utils import is_mainboard_code, is_st_name, normalize_code, parse_numeric
 
 
 DEFAULT_SOURCE = "akshare/eastmoney"
+EASTMONEY_DIRECT_SOURCE = "eastmoney/direct"
+SINA_SOURCE = "sina/market-center"
 TENCENT_SOURCE = "tencent/qt"
+MIN_FULL_MARKET_ROWS = 1000
 
 
 def fetched_at() -> str:
@@ -180,6 +183,172 @@ class AkshareMarketDataProvider:
         )
 
 
+class EastmoneyDirectMarketDataProvider:
+    source = EASTMONEY_DIRECT_SOURCE
+
+    def __init__(self, fetcher: Any | None = None, page_size: int = 500) -> None:
+        self.fetcher = fetcher or self._fetch_page
+        self.page_size = page_size
+
+    def _fetch_page(self, *, page: int, page_size: int) -> dict[str, Any]:
+        response = requests.get(
+            "https://82.push2.eastmoney.com/api/qt/clist/get",
+            params={
+                "pn": page,
+                "pz": page_size,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f3",
+                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                "fields": "f12,f14,f2,f3,f8,f10,f6",
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        page = 1
+        total = None
+        while True:
+            payload = self.fetcher(page=page, page_size=self.page_size)
+            data = payload.get("data") or {}
+            diff = data.get("diff") or []
+            total = total if total is not None else data.get("total")
+            records.extend(diff)
+            if not diff:
+                break
+            if total is not None and len(records) >= int(total):
+                break
+            if len(diff) < self.page_size:
+                break
+            page += 1
+        return records
+
+    def quotes(self) -> pd.DataFrame:
+        rows = []
+        for item in self._records():
+            rows.append(
+                {
+                    "代码": normalize_code(item.get("f12")),
+                    "名称": item.get("f14", ""),
+                    "最新价": parse_numeric(item.get("f2")),
+                    "涨跌幅": parse_numeric(item.get("f3")),
+                    "换手率": parse_numeric(item.get("f8")),
+                    "量比": parse_numeric(item.get("f10")),
+                    "成交额": parse_numeric(item.get("f6")),
+                }
+            )
+        return pd.DataFrame.from_records(rows)
+
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        normalized = {normalize_code(code) for code in codes}
+        quotes = self.quotes()
+        if quotes.empty:
+            return quotes
+        return quotes[quotes["代码"].map(normalize_code).isin(normalized)].copy()
+
+    def indices(self) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback only provides full-market stock quotes")
+
+    def bid_ask(self, code: str) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback does not provide bid/ask depth")
+
+    def boards(self) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback does not provide board heat data")
+
+    def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback does not provide historical bars")
+
+
+class SinaMarketDataProvider:
+    source = SINA_SOURCE
+
+    def __init__(self, fetcher: Any | None = None, page_size: int = 100) -> None:
+        self.fetcher = fetcher or self._fetch_page
+        self.page_size = page_size
+
+    def _fetch_page(self, *, node: str, page: int, page_size: int) -> list[dict[str, Any]]:
+        response = requests.get(
+            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+            params={
+                "page": page,
+                "num": page_size,
+                "sort": "changepercent",
+                "asc": 0,
+                "node": node,
+                "symbol": "",
+                "_s_r_a": "page",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    def _records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for node in ("sh_a", "sz_a"):
+            page = 1
+            while True:
+                batch = self.fetcher(node=node, page=page, page_size=self.page_size)
+                if not batch:
+                    break
+                records.extend(batch)
+                if len(batch) < self.page_size:
+                    break
+                page += 1
+        return records
+
+    def quotes(self) -> pd.DataFrame:
+        rows = []
+        seen: set[str] = set()
+        for item in self._records():
+            code = normalize_code(item.get("code"))
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            rows.append(
+                {
+                    "代码": code,
+                    "名称": item.get("name", ""),
+                    "最新价": parse_numeric(item.get("trade")),
+                    "涨跌幅": parse_numeric(item.get("changepercent")),
+                    "换手率": parse_numeric(item.get("turnoverratio")),
+                    "量比": float("nan"),
+                    "成交额": parse_numeric(item.get("amount")),
+                }
+            )
+        return pd.DataFrame.from_records(rows)
+
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        normalized = {normalize_code(code) for code in codes}
+        quotes = self.quotes()
+        if quotes.empty:
+            return quotes
+        return quotes[quotes["代码"].map(normalize_code).isin(normalized)].copy()
+
+    def indices(self) -> pd.DataFrame:
+        raise RuntimeError("Sina market-center fallback only provides full-market stock quotes")
+
+    def bid_ask(self, code: str) -> pd.DataFrame:
+        raise RuntimeError("Sina market-center fallback does not provide bid/ask depth")
+
+    def boards(self) -> pd.DataFrame:
+        raise RuntimeError("Sina market-center fallback does not provide board heat data")
+
+    def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
+        raise RuntimeError("Sina market-center fallback does not provide historical bars")
+
+
 def _tencent_symbol(code: str, *, compact_index: bool = False) -> str:
     code = normalize_code(code)
     if code.startswith(("6", "5", "9")):
@@ -296,7 +465,13 @@ class FallbackMarketDataProvider:
             return getattr(self.fallback, method)(*args, **kwargs)
 
     def quotes(self) -> pd.DataFrame:
-        return self._with_fallback("quotes")
+        try:
+            quotes = self.primary.quotes()
+            if isinstance(quotes, pd.DataFrame) and 0 < len(quotes) < MIN_FULL_MARKET_ROWS:
+                raise RuntimeError(f"Primary full-market quotes incomplete: {len(quotes)} rows")
+            return quotes
+        except Exception:
+            return self.fallback.quotes()
 
     def quotes_for(self, codes: list[str]) -> pd.DataFrame:
         if hasattr(self.primary, "quotes_for"):
@@ -317,6 +492,19 @@ class FallbackMarketDataProvider:
 
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         return self._with_fallback("hist", code, report_date=report_date)
+
+
+def create_default_provider() -> FallbackMarketDataProvider:
+    return FallbackMarketDataProvider(
+        primary=AkshareMarketDataProvider(),
+        fallback=FallbackMarketDataProvider(
+            primary=EastmoneyDirectMarketDataProvider(),
+            fallback=FallbackMarketDataProvider(
+                primary=SinaMarketDataProvider(),
+                fallback=TencentMarketDataProvider(),
+            ),
+        ),
+    )
 
 
 class StaticMarketDataProvider:
@@ -362,7 +550,7 @@ class StaticMarketDataProvider:
 
 class MarketDataService:
     def __init__(self, provider: Any | None = None) -> None:
-        self.provider = provider or FallbackMarketDataProvider()
+        self.provider = provider or create_default_provider()
 
     @property
     def source(self) -> str:

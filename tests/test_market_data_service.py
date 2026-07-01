@@ -5,8 +5,10 @@ from datetime import date
 import pandas as pd
 
 from src.a_share_research.market_data_service import (
+    EastmoneyDirectMarketDataProvider,
     FallbackMarketDataProvider,
     MarketDataService,
+    SinaMarketDataProvider,
     StaticMarketDataProvider,
     TencentMarketDataProvider,
     classify_bid_ask_actionability,
@@ -187,6 +189,112 @@ def test_stock_quotes_falls_back_to_tencent_when_primary_fails() -> None:
     assert out["source"] == "broken+tencent/qt"
     assert out["data"]["quotes"][0]["code"] == "600879"
     assert out["data"]["quotes"][0]["latest_price"] == 21.45
+
+
+def test_eastmoney_direct_provider_parses_full_market_quotes() -> None:
+    payload = {
+        "data": {
+            "total": 3,
+            "diff": [
+                {"f12": "000001", "f14": "平安银行", "f2": 10.0, "f3": 1.2, "f8": 2.0, "f10": 1.1, "f6": 1000000},
+                {"f12": "000002", "f14": "万科A", "f2": 8.0, "f3": -0.8, "f8": 3.0, "f10": 0.9, "f6": 800000},
+                {"f12": "600000", "f14": "浦发银行", "f2": 9.0, "f3": 10.0, "f8": 4.0, "f10": 2.0, "f6": 900000},
+            ],
+        }
+    }
+    provider = EastmoneyDirectMarketDataProvider(fetcher=lambda **_kwargs: payload, page_size=100)
+
+    quotes = provider.quotes()
+
+    assert len(quotes) == 3
+    assert list(quotes["代码"]) == ["000001", "000002", "600000"]
+    assert list(quotes["涨跌幅"]) == [1.2, -0.8, 10.0]
+
+
+def test_sina_provider_paginates_full_market_quotes() -> None:
+    payloads = {
+        ("sh_a", 1): [
+            {"code": "600000", "name": "浦发银行", "trade": "9.00", "changepercent": "1.20", "turnoverratio": "2.0", "amount": "1000000"},
+        ],
+        ("sz_a", 1): [
+            {"code": "000001", "name": "平安银行", "trade": "10.00", "changepercent": "-0.80", "turnoverratio": "3.0", "amount": "800000"},
+        ],
+    }
+    provider = SinaMarketDataProvider(fetcher=lambda *, node, page, page_size: payloads.get((node, page), []), page_size=100)
+
+    quotes = provider.quotes()
+
+    assert set(quotes["代码"]) == {"600000", "000001"}
+    assert set(quotes["涨跌幅"]) == {1.2, -0.8}
+
+
+def test_default_market_snapshot_uses_direct_breadth_when_akshare_fails() -> None:
+    class BrokenAkshare:
+        source = "broken-akshare"
+
+        def quotes(self) -> pd.DataFrame:
+            raise ConnectionError("akshare quote disconnected")
+
+        def indices(self) -> pd.DataFrame:
+            return pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}])
+
+    payload = {
+        "data": {
+            "total": 2,
+            "diff": [
+                {"f12": "000001", "f14": "平安银行", "f2": 10.0, "f3": 1.2},
+                {"f12": "000002", "f14": "万科A", "f2": 8.0, "f3": -0.8},
+            ],
+        }
+    }
+    provider = FallbackMarketDataProvider(
+        primary=BrokenAkshare(),
+        fallback=EastmoneyDirectMarketDataProvider(fetcher=lambda **_kwargs: payload, page_size=100),
+    )
+
+    out = MarketDataService(provider=provider).market_snapshot()
+
+    assert out["freshness"] == "live"
+    assert out["data"]["breadth_available"] is True
+    assert out["data"]["up_count"] == 1
+    assert out["data"]["down_count"] == 1
+    assert out["data"]["breadth_error"] is None
+
+
+def test_market_snapshot_rejects_incomplete_primary_breadth() -> None:
+    class IncompletePrimary:
+        source = "incomplete-primary"
+
+        def quotes(self) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {"代码": f"000{i:03d}", "名称": f"样本{i}", "最新价": 10.0, "涨跌幅": 10.0}
+                    for i in range(100)
+                ]
+            )
+
+        def indices(self) -> pd.DataFrame:
+            return pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}])
+
+    payload = {
+        "data": {
+            "total": 2,
+            "diff": [
+                {"f12": "000001", "f14": "平安银行", "f2": 10.0, "f3": 1.2},
+                {"f12": "000002", "f14": "万科A", "f2": 8.0, "f3": -0.8},
+            ],
+        }
+    }
+    provider = FallbackMarketDataProvider(
+        primary=IncompletePrimary(),
+        fallback=EastmoneyDirectMarketDataProvider(fetcher=lambda **_kwargs: payload, page_size=100),
+    )
+
+    out = MarketDataService(provider=provider).market_snapshot()
+
+    assert out["freshness"] == "live"
+    assert out["data"]["up_count"] == 1
+    assert out["data"]["down_count"] == 1
 
 
 def test_market_snapshot_partial_fallback_uses_json_safe_nulls() -> None:
