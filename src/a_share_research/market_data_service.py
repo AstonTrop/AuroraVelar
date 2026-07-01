@@ -271,8 +271,16 @@ class EastmoneyDirectMarketDataProvider:
 class SinaMarketDataProvider:
     source = SINA_SOURCE
 
-    def __init__(self, fetcher: Any | None = None, page_size: int = 100) -> None:
+    def __init__(
+        self,
+        fetcher: Any | None = None,
+        board_fetcher: Any | None = None,
+        hist_fetcher: Any | None = None,
+        page_size: int = 100,
+    ) -> None:
         self.fetcher = fetcher or self._fetch_page
+        self.board_fetcher = board_fetcher or self._fetch_board
+        self.hist_fetcher = hist_fetcher or self._fetch_hist
         self.page_size = page_size
 
     def _fetch_page(self, *, node: str, page: int, page_size: int) -> list[dict[str, Any]]:
@@ -336,17 +344,97 @@ class SinaMarketDataProvider:
             return quotes
         return quotes[quotes["代码"].map(normalize_code).isin(normalized)].copy()
 
+    def _fetch_board(self, board_type: str) -> str:
+        if board_type == "行业":
+            url = "http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
+            params = None
+        else:
+            url = "http://money.finance.sina.com.cn/q/view/newFLJK.php"
+            params = {"param": "class"}
+        response = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or response.encoding
+        return response.text
+
+    def _parse_board_text(self, text: str, board_type: str) -> pd.DataFrame:
+        import json  # noqa: PLC0415
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end < start:
+            return pd.DataFrame()
+        payload = json.loads(text[start : end + 1])
+        rows = []
+        for value in payload.values():
+            parts = str(value).split(",")
+            if len(parts) < 13:
+                continue
+            rows.append(
+                {
+                    "board_type": board_type,
+                    "board_name": parts[1],
+                    "change_pct": parse_numeric(parts[5]),
+                    "up_count": 0.0,
+                    "down_count": 0.0,
+                    "leader_code": normalize_code(parts[8]),
+                    "leader": parts[12],
+                    "leader_price": parse_numeric(parts[10]),
+                    "leader_change_pct": parse_numeric(parts[9]),
+                }
+            )
+        out = pd.DataFrame.from_records(rows)
+        if out.empty:
+            return out
+        out["up_ratio"] = 0.0
+        out["board_action"] = out["change_pct"].map(lambda value: "只观察" if parse_numeric(value) >= 0 else "回避")
+        return out
+
+    def boards(self) -> pd.DataFrame:
+        frames = []
+        for board_type in ("行业", "概念"):
+            text = self.board_fetcher(board_type)
+            parsed = self._parse_board_text(text, board_type)
+            if not parsed.empty:
+                frames.append(parsed)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     def indices(self) -> pd.DataFrame:
         raise RuntimeError("Sina market-center fallback only provides full-market stock quotes")
 
     def bid_ask(self, code: str) -> pd.DataFrame:
         raise RuntimeError("Sina market-center fallback does not provide bid/ask depth")
 
-    def boards(self) -> pd.DataFrame:
-        raise RuntimeError("Sina market-center fallback does not provide board heat data")
+    def _fetch_hist(self, *, symbol: str, datalen: int) -> list[dict[str, Any]]:
+        response = requests.get(
+            "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
+            params={"symbol": symbol, "scale": 240, "ma": "no", "datalen": datalen},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
 
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
-        raise RuntimeError("Sina market-center fallback does not provide historical bars")
+        code = normalize_code(code)
+        symbol = _tencent_symbol(code)
+        rows = self.hist_fetcher(symbol=symbol, datalen=180)
+        out = pd.DataFrame.from_records(rows)
+        if out.empty:
+            return out
+        rename_map = {
+            "day": "日期",
+            "open": "开盘",
+            "high": "最高",
+            "low": "最低",
+            "close": "收盘",
+            "volume": "成交量",
+        }
+        out = out.rename(columns=rename_map)
+        for col in ["开盘", "最高", "最低", "收盘", "成交量"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce")
+        return out
 
 
 def _tencent_symbol(code: str, *, compact_index: bool = False) -> str:
@@ -674,6 +762,11 @@ class MarketDataService:
             name = str(row["name"])
             if not is_mainboard_code(code) or is_st_name(name) or "退" in name:
                 continue
+            normalized_name = name.strip().upper()
+            day_change_pct = float(row["day_change_pct"])
+            if normalized_name.startswith(("C", "N")):
+                rejected.append({"code": code, "name": name, "reason": "新股/次新波动过大"})
+                continue
             bidask = self.stock_bidask(code, cash=cash)
             if bidask["freshness"] == "unavailable":
                 rejected.append({"code": code, "name": name, "reason": "盘口不可用"})
@@ -682,6 +775,9 @@ class MarketDataService:
             if action["actionability"] != "可买":
                 rejected.append({"code": code, "name": name, "reason": action["actionability"]})
                 continue
+            if day_change_pct >= 9.5:
+                rejected.append({"code": code, "name": name, "reason": "涨幅过高不追"})
+                continue
             tech = self.technical(code)
             tech_data = tech["data"] if tech["freshness"] != "unavailable" else {}
             candidates.append(
@@ -689,7 +785,7 @@ class MarketDataService:
                     "code": code,
                     "name": name,
                     "latest_price": float(row["latest_price"]),
-                    "day_change_pct": float(row["day_change_pct"]),
+                    "day_change_pct": day_change_pct,
                     "min_lot_cost": action["min_lot_cost"],
                     "actionability": action["actionability"],
                     "technical_score": tech_data.get("technical_score"),

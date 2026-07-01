@@ -109,6 +109,42 @@ def test_actionable_candidates_filters_cash_and_limit_up() -> None:
     assert rejected["000003"] == "现金不足"
 
 
+def test_actionable_candidates_rejects_new_stock_and_overheated_gain() -> None:
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "001399", "名称": "C惠科", "最新价": 46.28, "涨跌幅": 21.21, "换手率": 51.0, "量比": 1.1},
+                {"代码": "000001", "名称": "高涨幅A", "最新价": 6.0, "涨跌幅": 9.8, "换手率": 3.0, "量比": 1.2},
+            ]
+        ),
+        bidasks={
+            "001399": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 46.28},
+                    {"item": "涨幅", "value": 21.21},
+                    {"item": "sell_1", "value": 46.29},
+                    {"item": "buy_1", "value": 46.28},
+                ]
+            ),
+            "000001": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 6.0},
+                    {"item": "涨幅", "value": 9.8},
+                    {"item": "sell_1", "value": 6.01},
+                    {"item": "buy_1", "value": 6.0},
+                ]
+            ),
+        },
+    )
+
+    out = MarketDataService(provider=provider).actionable_candidates(cash=5000.0, price_limit=50.0)
+
+    assert out["data"]["candidates"] == []
+    rejected = {item["code"]: item["reason"] for item in out["data"]["rejected"]}
+    assert rejected["001399"] == "新股/次新波动过大"
+    assert rejected["000001"] == "涨幅过高不追"
+
+
 def test_technical_endpoint_returns_trade_points() -> None:
     provider = StaticMarketDataProvider(
         hist={
@@ -226,6 +262,36 @@ def test_sina_provider_paginates_full_market_quotes() -> None:
 
     assert set(quotes["代码"]) == {"600000", "000001"}
     assert set(quotes["涨跌幅"]) == {1.2, -0.8}
+
+
+def test_sina_provider_parses_boards() -> None:
+    payload = 'var S_Finance_bankuai_sinaindustry = {"new_dlhy":"new_dlhy,电力行业,62,8.9,0.19,2.23,1,2,sh600021,9.95,10.00,0.90,上海电力"}'
+    provider = SinaMarketDataProvider(
+        fetcher=lambda *, node, page, page_size: [],
+        board_fetcher=lambda board_type: payload,
+    )
+
+    boards = provider.boards()
+
+    assert boards.iloc[0]["board_name"] == "电力行业"
+    assert boards.iloc[0]["change_pct"] == 2.23
+    assert boards.iloc[0]["leader_code"] == "600021"
+    assert boards.iloc[0]["leader"] == "上海电力"
+
+
+def test_sina_provider_parses_daily_hist() -> None:
+    provider = SinaMarketDataProvider(
+        fetcher=lambda *, node, page, page_size: [],
+        hist_fetcher=lambda *, symbol, datalen: [
+            {"day": "2026-06-29", "open": "10.0", "high": "10.5", "low": "9.8", "close": "10.2", "volume": "1000"},
+            {"day": "2026-06-30", "open": "10.2", "high": "10.8", "low": "10.1", "close": "10.6", "volume": "1200"},
+        ],
+    )
+
+    hist = provider.hist("600000")
+
+    assert list(hist["收盘"]) == [10.2, 10.6]
+    assert list(hist["日期"]) == ["2026-06-29", "2026-06-30"]
 
 
 def test_default_market_snapshot_uses_direct_breadth_when_akshare_fails() -> None:
