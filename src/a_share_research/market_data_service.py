@@ -5,16 +5,35 @@ from typing import Any
 import re
 
 import pandas as pd
+import requests
 
 from .portfolio import fetch_board_snapshot, normalize_board_snapshot, summarize_board_strength, summarize_technical_profile
 from .utils import is_mainboard_code, is_st_name, normalize_code, parse_numeric
 
 
 DEFAULT_SOURCE = "akshare/eastmoney"
+TENCENT_SOURCE = "tencent/qt"
 
 
 def fetched_at() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
 
 
 def normalize_stock_code(raw: object) -> str:
@@ -37,7 +56,7 @@ def response_envelope(
         "fetched_at": fetched_time or fetched_at(),
         "freshness": freshness,
         "is_stale": freshness == "stale_cache",
-        "data": data,
+        "data": json_safe(data),
     }
 
 
@@ -130,6 +149,15 @@ class AkshareMarketDataProvider:
     def quotes(self) -> pd.DataFrame:
         return self._ak().stock_zh_a_spot_em()
 
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        quotes = self.quotes()
+        normalized = {normalize_code(code) for code in codes}
+        code_col = _quote_col(quotes, "代码", "code", "股票代码")
+        if code_col is None:
+            return quotes
+        work = quotes.copy()
+        return work[work[code_col].map(normalize_code).isin(normalized)]
+
     def indices(self) -> pd.DataFrame:
         return self._ak().stock_zh_index_spot_em()
 
@@ -152,6 +180,145 @@ class AkshareMarketDataProvider:
         )
 
 
+def _tencent_symbol(code: str, *, compact_index: bool = False) -> str:
+    code = normalize_code(code)
+    if code.startswith(("6", "5", "9")):
+        prefix = "sh"
+    else:
+        prefix = "sz"
+    if compact_index:
+        return f"s_{prefix}{code}"
+    return f"{prefix}{code}"
+
+
+def _parse_tencent_lines(text: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in text.split(";"):
+        if '="' not in line:
+            continue
+        payload = line.split('="', 1)[1].rstrip('"')
+        if payload:
+            rows.append(payload.split("~"))
+    return rows
+
+
+class TencentMarketDataProvider:
+    source = TENCENT_SOURCE
+
+    def __init__(self, fetcher: Any | None = None) -> None:
+        self.fetcher = fetcher or self._fetch
+
+    def _fetch(self, symbols: list[str]) -> str:
+        response = requests.get(
+            "https://qt.gtimg.cn/q=" + ",".join(symbols),
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        response.encoding = "gbk"
+        return response.text
+
+    def quotes(self) -> pd.DataFrame:
+        raise RuntimeError("Tencent quote fallback requires explicit stock codes")
+
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        symbols = [_tencent_symbol(code) for code in codes if normalize_code(code)]
+        rows = _parse_tencent_lines(self.fetcher(symbols)) if symbols else []
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            if len(row) < 4:
+                continue
+            records.append(
+                {
+                    "代码": normalize_code(row[2]),
+                    "名称": row[1],
+                    "最新价": parse_numeric(row[3]),
+                    "涨跌幅": parse_numeric(row[32]) if len(row) > 32 else float("nan"),
+                    "成交额": parse_numeric(row[38]) if len(row) > 38 else float("nan"),
+                    "换手率": parse_numeric(row[38]) if len(row) > 38 else float("nan"),
+                    "量比": parse_numeric(row[49]) if len(row) > 49 else float("nan"),
+                }
+            )
+        return pd.DataFrame.from_records(records)
+
+    def indices(self) -> pd.DataFrame:
+        symbols = [
+            "s_sh000001",
+            "s_sz399001",
+            "s_sz399006",
+            "s_sh000300",
+        ]
+        rows = _parse_tencent_lines(self.fetcher(symbols))
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            if len(row) < 6:
+                continue
+            records.append(
+                {
+                    "代码": normalize_code(row[2]),
+                    "名称": row[1],
+                    "最新价": parse_numeric(row[3]),
+                    "涨跌幅": parse_numeric(row[5]),
+                }
+            )
+        return pd.DataFrame.from_records(records)
+
+    def bid_ask(self, code: str) -> pd.DataFrame:
+        rows = _parse_tencent_lines(self.fetcher([_tencent_symbol(code)]))
+        if not rows:
+            return pd.DataFrame()
+        row = rows[0]
+        data = {
+            "最新": parse_numeric(row[3]) if len(row) > 3 else float("nan"),
+            "涨幅": parse_numeric(row[32]) if len(row) > 32 else float("nan"),
+            "buy_1": parse_numeric(row[9]) if len(row) > 9 else float("nan"),
+            "sell_1": parse_numeric(row[19]) if len(row) > 19 else float("nan"),
+        }
+        return pd.DataFrame([{"item": key, "value": value} for key, value in data.items()])
+
+    def boards(self) -> pd.DataFrame:
+        raise RuntimeError("Tencent fallback does not provide board heat data")
+
+    def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
+        raise RuntimeError("Tencent fallback does not provide historical bars")
+
+
+class FallbackMarketDataProvider:
+    def __init__(self, primary: Any | None = None, fallback: Any | None = None) -> None:
+        self.primary = primary or AkshareMarketDataProvider()
+        self.fallback = fallback or TencentMarketDataProvider()
+        self.source = f"{getattr(self.primary, 'source', DEFAULT_SOURCE)}+{getattr(self.fallback, 'source', TENCENT_SOURCE)}"
+
+    def _with_fallback(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return getattr(self.primary, method)(*args, **kwargs)
+        except Exception:
+            return getattr(self.fallback, method)(*args, **kwargs)
+
+    def quotes(self) -> pd.DataFrame:
+        return self._with_fallback("quotes")
+
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        if hasattr(self.primary, "quotes_for"):
+            try:
+                return self.primary.quotes_for(codes)
+            except Exception:
+                pass
+        return self.fallback.quotes_for(codes)
+
+    def indices(self) -> pd.DataFrame:
+        return self._with_fallback("indices")
+
+    def bid_ask(self, code: str) -> pd.DataFrame:
+        return self._with_fallback("bid_ask", code)
+
+    def boards(self) -> pd.DataFrame:
+        return self._with_fallback("boards")
+
+    def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
+        return self._with_fallback("hist", code, report_date=report_date)
+
+
 class StaticMarketDataProvider:
     source: str = "static-test"
 
@@ -172,6 +339,14 @@ class StaticMarketDataProvider:
     def quotes(self) -> pd.DataFrame:
         return self.quotes_df.copy()
 
+    def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+        normalized = {normalize_code(code) for code in codes}
+        quotes = self.quotes()
+        code_col = _quote_col(quotes, "代码", "code", "股票代码")
+        if code_col is None:
+            return quotes
+        return quotes[quotes[code_col].map(normalize_code).isin(normalized)].copy()
+
     def indices(self) -> pd.DataFrame:
         return self.indices_df.copy()
 
@@ -187,7 +362,7 @@ class StaticMarketDataProvider:
 
 class MarketDataService:
     def __init__(self, provider: Any | None = None) -> None:
-        self.provider = provider or AkshareMarketDataProvider()
+        self.provider = provider or FallbackMarketDataProvider()
 
     @property
     def source(self) -> str:
@@ -200,11 +375,24 @@ class MarketDataService:
         return response_envelope({"status": "ok", "provider": self.source}, source=self.source)
 
     def market_snapshot(self) -> dict[str, Any]:
+        quote_error = None
+        index_error = None
         try:
             quotes = normalize_quotes_df(self.provider.quotes())
+        except Exception as exc:  # noqa: BLE001
+            quotes = pd.DataFrame()
+            quote_error = f"{type(exc).__name__}: {exc}"
+        try:
             indices = normalize_quotes_df(self.provider.indices())
         except Exception as exc:  # noqa: BLE001
-            return self._unavailable(exc)
+            indices = pd.DataFrame()
+            index_error = f"{type(exc).__name__}: {exc}"
+        if quotes.empty and indices.empty:
+            return response_envelope(
+                {"error": quote_error or index_error or "No market data returned"},
+                source=self.source,
+                freshness="unavailable",
+            )
         up_count = int((quotes["day_change_pct"] > 0).sum()) if not quotes.empty else 0
         down_count = int((quotes["day_change_pct"] < 0).sum()) if not quotes.empty else 0
         limit_up_count = int((quotes["day_change_pct"] >= 9.7).sum()) if not quotes.empty else 0
@@ -218,12 +406,19 @@ class MarketDataService:
             "limit_up_count": limit_up_count,
             "limit_down_count": limit_down_count,
             "market_temperature": market_temperature,
+            "breadth_available": not quotes.empty,
+            "breadth_error": quote_error,
+            "index_error": index_error,
         }
-        return response_envelope(data, source=self.source)
+        freshness = "live" if quote_error is None and index_error is None else "partial_live"
+        return response_envelope(data, source=self.source, freshness=freshness)
 
     def stock_quotes(self, codes: list[str]) -> dict[str, Any]:
         try:
-            quotes = normalize_quotes_df(self.provider.quotes())
+            if hasattr(self.provider, "quotes_for"):
+                quotes = normalize_quotes_df(self.provider.quotes_for(codes))
+            else:
+                quotes = normalize_quotes_df(self.provider.quotes())
         except Exception as exc:  # noqa: BLE001
             return self._unavailable(exc)
         code_set = {normalize_code(code) for code in codes}
