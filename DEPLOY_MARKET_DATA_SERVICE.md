@@ -31,22 +31,22 @@ https://a-share-market-data-service.onrender.com
 ## 接入 Custom GPT Actions
 
 1. 打开 ChatGPT -> Explore GPTs -> Create。
-2. 进入 Configure -> Actions。
-3. 点击 Create new action。
-4. Authentication 选择 None。
-5. Schema 粘贴 `chatgpt_action_openapi.yaml` 的完整内容。
-6. 点击 Test，优先测试 `health`、`getStockQuotes`、`getMarketSnapshot`。
+2. 中文界面进入 `配置`。
+3. `说明` 粘贴 `GPT_STOCK_ANALYSIS_INSTRUCTIONS.md` 的完整内容。
+4. 找到 `操作`，点击 `创建新操作` 或 `添加操作`。
+5. `身份验证` 选择 `无`。
+6. `架构` 粘贴 `chatgpt_action_openapi.yaml` 的完整内容。
+7. `隐私政策` 填写：
+
+```text
+https://a-share-market-data-service.onrender.com/privacy
+```
+
+8. 点击测试，优先测试 `health`、`getStockQuotes`、`getMarketSnapshot`。
 
 ## 对 GPT 的使用提示
 
 ```text
-你做 A 股分析前，必须先调用 Actions 获取：
-1. /market/snapshot
-2. /boards/hot
-3. /stock/quotes
-4. /stock/bidask
-5. /stock/technical
-6. /candidates/actionable
-
-所有结论必须标注 freshness。如果 freshness 是 unavailable 或 stale_cache，不允许输出强买入建议。
+GPT 的说明请使用 GPT_STOCK_ANALYSIS_INSTRUCTIONS.md。
+Actions 架构请使用 chatgpt_action_openapi.yaml。
 ```
