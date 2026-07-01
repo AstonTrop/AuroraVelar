@@ -32,9 +32,10 @@ https://a-share-market-data-service.onrender.com
 
 1. 打开 ChatGPT -> Explore GPTs -> Create。
 2. 进入 Configure -> Actions。
-3. 粘贴 `chatgpt_action_openapi.yaml`。
-4. 把 `servers.url` 替换为你的 Render HTTPS 地址。
-5. Authentication 选择 None。
+3. 点击 Create new action。
+4. Authentication 选择 None。
+5. Schema 粘贴 `chatgpt_action_openapi.yaml` 的完整内容。
+6. 点击 Test，优先测试 `health`、`getStockQuotes`、`getMarketSnapshot`。
 
 ## 对 GPT 的使用提示
 

@@ -4,8 +4,8 @@ info:
   version: 0.1.0
   description: 获取A股实时大盘、个股报价、盘口、板块、技术点位和持仓分析数据。
 servers:
-  - url: https://YOUR-DEPLOYED-DOMAIN.example.com
-    description: Replace with your deployed HTTPS service URL
+  - url: https://a-share-market-data-service.onrender.com
+    description: Render deployment
 paths:
   /health:
     get:
