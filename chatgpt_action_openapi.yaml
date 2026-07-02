@@ -77,7 +77,7 @@ paths:
     post:
       operationId: getStockIntradayAnalysis
       summary: 获取单只股票盘中交易分析数据结构
-      description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、板块、市场状态、涨停池关联和账户约束，用于盘中买卖点判断。
+      description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、板块、市场状态、涨停池关联、账户约束、偏进攻交易评分和交易计划，用于盘中买卖点判断。
       requestBody:
         required: true
         content:
@@ -124,7 +124,7 @@ paths:
                 - code
       responses:
         "200":
-          description: 单票盘中交易分析用完整数据结构和数据质量标记
+          description: 单票盘中交易分析用完整数据结构、数据质量标记、decision_score和trading_plan
   /candidates/actionable:
     get:
       operationId: getActionableCandidates

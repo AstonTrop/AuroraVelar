@@ -360,6 +360,27 @@ def test_stock_intraday_analysis_returns_trading_decision_data_contract() -> Non
     assert out["market"]["trading_phase"] in {"pre_open", "continuous_auction", "lunch_break", "after_close", "non_trading_day"}
     assert out["account"]["positions"][0]["today_buy_flag"] is True
     assert out["account"]["sector_exposure"][0]["sector"] == "饲料"
+    assert out["decision_score"]["style"] == "aggressive_growth"
+    assert out["decision_score"]["target_attack_position_pct"] >= 65
+    assert out["decision_score"]["probability_band"] in {"高胜率", "中高胜率", "中性", "低胜率", "不适合交易"}
+    assert out["trading_plan"]["style_note"] == "偏进攻、弱保守；允许进攻仓位在65%以上，但必须有失败线"
+    assert out["trading_plan"]["buy_condition"]
+    assert out["trading_plan"]["failure_line"]
+
+
+def test_stock_intraday_analysis_aggressive_score_penalizes_weak_data_quality() -> None:
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "002100", "名称": "天康生物", "最新价": 8.76, "涨跌幅": 1.0}]),
+        hist={"002100": pd.DataFrame({"收盘": [5 + i * 0.05 for i in range(80)]})},
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis(
+        {"code": "002100", "account": {"cash": 5000, "total_asset": 12000, "positions": []}}
+    )
+
+    assert out["decision_score"]["total_score"] < 65
+    assert out["decision_score"]["probability_band"] in {"中性", "低胜率", "不适合交易"}
+    assert "缺少分时或盘口关键数据" in out["decision_score"]["risk_flags"]
 
 
 def test_stock_intraday_analysis_does_not_invent_unmatched_board() -> None:

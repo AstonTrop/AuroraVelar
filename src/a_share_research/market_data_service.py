@@ -1373,6 +1373,283 @@ class MarketDataService:
             ],
         }
 
+    def _decision_score(
+        self,
+        *,
+        quote: dict[str, Any],
+        intraday: dict[str, Any],
+        order_book: dict[str, Any],
+        recent_trades: dict[str, Any],
+        technical: dict[str, Any],
+        board: dict[str, Any],
+        market: dict[str, Any],
+        account: dict[str, Any],
+        data_quality: dict[str, Any],
+    ) -> dict[str, Any]:
+        risk_flags: list[str] = []
+        positive_flags: list[str] = []
+        latest_price = _nullable_float(quote.get("latest_price"))
+        change_pct = _nullable_float(quote.get("change_pct"))
+        cash = _nullable_float(account.get("cash"))
+        min_lot_cost = latest_price * 100 if latest_price is not None else None
+
+        if data_quality.get("quote_status") != "ok":
+            risk_flags.append("实时报价不可确认")
+        if data_quality.get("intraday_status") != "ok" or data_quality.get("order_book_status") != "ok":
+            risk_flags.append("缺少分时或盘口关键数据")
+        if data_quality.get("recent_trades_status") != "ok":
+            risk_flags.append("逐笔成交不可确认")
+        if data_quality.get("board_status") not in {"ok", "partial"}:
+            risk_flags.append("板块匹配不足")
+        if latest_price is not None and cash is not None and min_lot_cost is not None and cash < min_lot_cost:
+            risk_flags.append("现金不足买一手")
+        if order_book.get("actionability") not in {None, "可买"}:
+            risk_flags.append(str(order_book.get("actionability")))
+        if change_pct is not None and change_pct >= 8:
+            risk_flags.append("日内涨幅偏高，防止追高")
+
+        market_score = 8
+        if market.get("risk_mode") == "attack":
+            market_score = 15
+            positive_flags.append("市场广度支持进攻")
+        elif market.get("risk_mode") == "neutral":
+            market_score = 11
+        elif market.get("risk_mode") == "defense":
+            market_score = 5
+            risk_flags.append("市场风险模式偏防守")
+        elif market.get("trading_phase") in {"continuous_auction", "lunch_break", "after_close"}:
+            market_score = 9
+
+        board_score = 6
+        industry = board.get("industry") if isinstance(board.get("industry"), dict) else {}
+        concepts = board.get("concepts") if isinstance(board.get("concepts"), list) else []
+        industry_change = _nullable_float(industry.get("change_pct")) if industry else None
+        industry_rank = _nullable_int(industry.get("rank")) if industry else None
+        if board.get("status") == "ok":
+            board_score = 12
+            if industry_change is not None and industry_change > 0:
+                board_score += 3
+            if industry_rank is not None and industry_rank <= 10:
+                board_score += 3
+            industry_inflow = _nullable_float(industry.get("main_net_inflow")) if industry else None
+            if industry_inflow is not None and industry_inflow > 0:
+                board_score += 2
+            if concepts:
+                board_score += 1
+            positive_flags.append("板块数据可用于方向确认")
+        elif board.get("status") == "partial":
+            board_score = 8
+            risk_flags.append("个股所属板块只能部分确认")
+        board_score = min(board_score, 20)
+
+        technical_score = 5
+        if technical.get("status") == "ok":
+            technical_score = 8
+            ma5 = _nullable_float(technical.get("ma5"))
+            ma20 = _nullable_float(technical.get("ma20"))
+            macd_hist = _nullable_float(technical.get("macd_hist"))
+            if latest_price is not None and ma20 is not None and latest_price >= ma20:
+                technical_score += 3
+                positive_flags.append("价格站上MA20")
+            if latest_price is not None and ma5 is not None and latest_price >= ma5:
+                technical_score += 2
+            if macd_hist is not None and macd_hist > 0:
+                technical_score += 2
+            if latest_price is not None and ma20 is not None and latest_price < ma20:
+                risk_flags.append("尚未重新站稳MA20")
+        else:
+            risk_flags.append("日K技术指标不可确认")
+        technical_score = min(technical_score, 15)
+
+        intraday_score = 2
+        rows = intraday.get("rows") if isinstance(intraday.get("rows"), list) else []
+        if intraday.get("status") == "ok" and rows:
+            last_row = rows[-1]
+            last_price = _nullable_float(last_row.get("close") or last_row.get("price"))
+            avg_price = _nullable_float(last_row.get("avg_price") or last_row.get("vwap"))
+            intraday_score = 9
+            if last_price is not None and avg_price is not None and last_price >= avg_price:
+                intraday_score = 14
+                positive_flags.append("分时站上均价")
+            elif last_price is not None and avg_price is not None:
+                risk_flags.append("分时暂未站回均价")
+        else:
+            risk_flags.append("缺少分时均价，不能判断低吸或追高")
+
+        order_book_score = 2
+        if order_book.get("status") == "ok":
+            order_book_score = 6
+            if order_book.get("actionability") == "可买":
+                order_book_score = 10
+                positive_flags.append("盘口可买且未触发硬否决")
+            if order_book.get("is_limit_up_sealed"):
+                order_book_score = 1
+        else:
+            risk_flags.append("盘口承接不可确认")
+
+        trade_score = 3
+        trades = recent_trades.get("rows") if isinstance(recent_trades.get("rows"), list) else []
+        if recent_trades.get("status") == "ok" and trades:
+            trade_score = 6
+            buy_large = sum(1 for item in trades if item.get("side") == "buy" and item.get("large_order_flag"))
+            sell_large = sum(1 for item in trades if item.get("side") == "sell" and item.get("large_order_flag"))
+            if buy_large > sell_large:
+                trade_score = 8
+                positive_flags.append("最近成交有主动大单迹象")
+            elif sell_large > buy_large:
+                risk_flags.append("最近成交卖出大单偏多")
+
+        account_score = 7
+        if latest_price is not None and cash is not None and min_lot_cost is not None and cash >= min_lot_cost:
+            account_score = 12
+            positive_flags.append("现金可支持一手交易")
+        positions = account.get("positions") if isinstance(account.get("positions"), list) else []
+        locked_positions = [item for item in positions if int(item.get("shares") or 0) > int(item.get("available") or 0)]
+        if len(locked_positions) >= 2:
+            account_score -= 3
+            risk_flags.append("锁仓股较多，新开仓需控制隔夜风险")
+        exposure_ratios = [
+            _nullable_float(item.get("ratio"))
+            for item in account.get("sector_exposure", [])
+            if isinstance(item, dict) and _nullable_float(item.get("ratio")) is not None
+        ]
+        if exposure_ratios and max(exposure_ratios) > 0.45:
+            account_score -= 2
+            risk_flags.append("同板块暴露偏高")
+        account_score = max(0, min(account_score, 14))
+
+        total_score = round(
+            market_score
+            + board_score
+            + technical_score
+            + intraday_score
+            + order_book_score
+            + trade_score
+            + account_score,
+            1,
+        )
+        if total_score >= 80:
+            probability_band = "高胜率"
+            suggested_action = "可进攻跟踪，等待买点触发后按计划执行"
+            target_attack_position_pct = 75
+        elif total_score >= 68:
+            probability_band = "中高胜率"
+            suggested_action = "可按偏进攻思路试仓或加仓，但必须贴近触发点"
+            target_attack_position_pct = 70
+        elif total_score >= 55:
+            probability_band = "中性"
+            suggested_action = "只做小仓试错或等待二次确认"
+            target_attack_position_pct = 65
+        elif total_score >= 40:
+            probability_band = "低胜率"
+            suggested_action = "只观察，不建议主动新开仓"
+            target_attack_position_pct = 45
+        else:
+            probability_band = "不适合交易"
+            suggested_action = "不建议买入，等待数据或结构改善"
+            target_attack_position_pct = 25
+
+        if "缺少分时或盘口关键数据" in risk_flags and total_score >= 65:
+            total_score = 64.0
+            probability_band = "中性"
+            suggested_action = "关键盘中数据不足，只观察，等分时和盘口恢复后再判断"
+            target_attack_position_pct = min(target_attack_position_pct, 60)
+
+        return {
+            "style": "aggressive_growth",
+            "style_note": "偏进攻、弱保守；分数用于纪律化筛选，不替代盘面解释",
+            "total_score": total_score,
+            "probability_band": probability_band,
+            "suggested_action": suggested_action,
+            "target_attack_position_pct": target_attack_position_pct,
+            "factor_scores": {
+                "market": market_score,
+                "board": board_score,
+                "technical": technical_score,
+                "intraday": intraday_score,
+                "order_book": order_book_score,
+                "recent_trades": trade_score,
+                "account": account_score,
+            },
+            "positive_flags": list(dict.fromkeys(positive_flags)),
+            "risk_flags": list(dict.fromkeys(risk_flags)),
+            "score_usage": "用于判断是否值得进入交易计划；不是收益预测，也不是自动下单信号",
+        }
+
+    def _trading_plan(
+        self,
+        *,
+        quote: dict[str, Any],
+        intraday: dict[str, Any],
+        order_book: dict[str, Any],
+        technical: dict[str, Any],
+        account: dict[str, Any],
+        decision_score: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest_price = _nullable_float(quote.get("latest_price"))
+        rows = intraday.get("rows") if isinstance(intraday.get("rows"), list) else []
+        last_row = rows[-1] if rows else {}
+        avg_price = _nullable_float(last_row.get("avg_price") or last_row.get("vwap"))
+        platform_support = _nullable_float(technical.get("platform_support") or technical.get("recent_low_20"))
+        platform_resistance = _nullable_float(technical.get("platform_resistance") or technical.get("recent_high_20"))
+        boll_upper = _nullable_float(technical.get("boll_upper"))
+        atr = _nullable_float(technical.get("atr"))
+        low = _nullable_float(quote.get("low"))
+        high = _nullable_float(quote.get("high"))
+
+        if avg_price is not None and latest_price is not None:
+            buy_condition = f"回踩分时均价{avg_price:.2f}附近不破，重新放量站回{latest_price:.2f}上方再考虑"
+        elif latest_price is not None:
+            buy_condition = f"等待分时均价和盘口恢复；若价格不追高、重新站稳{latest_price:.2f}附近再评估"
+        else:
+            buy_condition = "等待实时价格、分时均价和盘口恢复后再判断买点"
+
+        raw_supports = [value for value in [platform_support, low, latest_price - atr if latest_price is not None and atr is not None else None] if value is not None and value > 0]
+        lower_supports = [value for value in raw_supports if latest_price is None or value < latest_price]
+        if lower_supports:
+            failure_line_value = max(lower_supports)
+            failure_line = f"跌破{failure_line_value:.2f}且5-10分钟收不回，视为买入逻辑失败"
+        elif latest_price is not None and atr is not None:
+            failure_line = f"跌破{latest_price - atr:.2f}且反抽弱，视为买入逻辑失败"
+        else:
+            failure_line = "缺少技术支撑位，不能给精确失败线；先不做强买入"
+
+        raw_resistances = [value for value in [platform_resistance, boll_upper, high] if value is not None and value > 0]
+        upper_resistances = [value for value in raw_resistances if latest_price is None or value > latest_price]
+        if upper_resistances:
+            resistance_value = min(upper_resistances)
+            take_profit_line = f"接近{resistance_value:.2f}或放量滞涨时分批止盈/减仓"
+        elif latest_price is not None:
+            take_profit_line = "若从买点快速拉升5%-8%但量能跟不上，优先考虑减仓而非追高"
+        else:
+            take_profit_line = "等待技术压力位恢复后再设定止盈位"
+
+        cash = _nullable_float(account.get("cash"))
+        min_lot_cost = _nullable_float(order_book.get("min_lot_cost"))
+        max_lots = int(cash // min_lot_cost) if cash is not None and min_lot_cost not in (None, 0) else 0
+        if decision_score.get("total_score", 0) >= 68 and max_lots > 0:
+            position_plan = f"满足触发条件后可偏进攻，首笔1手起；若组合风险允许，目标进攻仓位可向{decision_score.get('target_attack_position_pct')}%靠近"
+        elif max_lots > 0:
+            position_plan = "当前只适合小仓或观察，不因有现金而强行买入"
+        else:
+            position_plan = "现金不足或一手成本不可确认，不能执行买入"
+
+        return {
+            "style_note": "偏进攻、弱保守；允许进攻仓位在65%以上，但必须有失败线",
+            "buy_condition": buy_condition,
+            "failure_line": failure_line,
+            "take_profit_line": take_profit_line,
+            "position_plan": position_plan,
+            "next_day_plan": "若今日买入，必须按T+1隔夜处理；明天低开跌破失败线且反抽弱，优先处理风险",
+            "point_sources": [
+                "分时均价" if avg_price is not None else "分时均价缺失",
+                "平台支撑/近20日低点" if platform_support is not None else "平台支撑缺失",
+                "平台压力/近20日高点" if platform_resistance is not None else "平台压力缺失",
+                "五档盘口可执行性",
+                "账户现金与T+1约束",
+            ],
+        }
+
     def stock_intraday_analysis(self, payload: dict[str, Any]) -> dict[str, Any]:
         code = normalize_code(payload.get("code", ""))
         limit = int(payload.get("intraday_limit", 0) or 0) or None
@@ -1444,6 +1721,25 @@ class MarketDataService:
             "missing_fields": missing_fields,
             "estimated_delay_seconds": 3 if phase == "continuous_auction" else None,
         }
+        decision_score = self._decision_score(
+            quote=quote,
+            intraday=intraday,
+            order_book=order_book,
+            recent_trades=recent_trades,
+            technical=technical,
+            board=board,
+            market=market,
+            account=account,
+            data_quality=data_quality,
+        )
+        trading_plan = self._trading_plan(
+            quote=quote,
+            intraday=intraday,
+            order_book=order_book,
+            technical=technical,
+            account=account,
+            decision_score=decision_score,
+        )
         freshness = "failed" if quote.get("status") == "failed" else freshness_for_phase(phase)
         return json_safe(
             {
@@ -1461,6 +1757,8 @@ class MarketDataService:
                 "market": market,
                 "zt_pool_related": zt_related,
                 "account": account,
+                "decision_score": decision_score,
+                "trading_plan": trading_plan,
             }
         )
 
