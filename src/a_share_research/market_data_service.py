@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from pathlib import Path
 from typing import Any
+import json
+import os
 import re
+import tempfile
 
 import pandas as pd
 import requests
@@ -991,12 +995,137 @@ def calculate_intraday_technical_indicators(hist_df: pd.DataFrame) -> dict[str, 
 
 
 class MarketDataService:
-    def __init__(self, provider: Any | None = None) -> None:
+    def __init__(self, provider: Any | None = None, review_store_path: str | Path | None = None) -> None:
         self.provider = provider or create_default_provider()
+        default_review_path = Path(tempfile.gettempdir()) / "a_share_review_ledger.json"
+        self.review_store_path = Path(
+            review_store_path or os.getenv("A_SHARE_REVIEW_STORE_PATH") or default_review_path
+        )
 
     @property
     def source(self) -> str:
         return str(getattr(self.provider, "source", DEFAULT_SOURCE))
+
+    def _read_review_records(self) -> list[dict[str, Any]]:
+        if not self.review_store_path.exists():
+            return []
+        try:
+            raw = json.loads(self.review_store_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return raw if isinstance(raw, list) else []
+
+    def _write_review_records(self, records: list[dict[str, Any]]) -> None:
+        self.review_store_path.parent.mkdir(parents=True, exist_ok=True)
+        self.review_store_path.write_text(
+            json.dumps(json_safe(records), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def log_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        code = normalize_code(payload.get("code", ""))
+        if not code:
+            return response_envelope({"error": "code is required"}, source=self.source, freshness="unavailable")
+        now = fetched_at()
+        records = self._read_review_records()
+        review_id = f"{now.replace('-', '').replace(':', '').replace(' ', '')}-{code}-{len(records) + 1}"
+        record = {
+            "review_id": review_id,
+            "created_at": now,
+            "updated_at": now,
+            "status": "open",
+            "code": code,
+            "name": str(payload.get("name", "") or ""),
+            "decision": str(payload.get("decision", "") or ""),
+            "decision_score": _nullable_float(payload.get("decision_score")),
+            "freshness": payload.get("freshness"),
+            "key_levels": payload.get("key_levels") if isinstance(payload.get("key_levels"), dict) else {},
+            "risk_tags": payload.get("risk_tags") if isinstance(payload.get("risk_tags"), list) else [],
+            "source": payload.get("source") or "manual_or_gpt",
+            "evaluation": None,
+        }
+        records.append(record)
+        self._write_review_records(records)
+        return response_envelope(
+            {
+                "record": record,
+                "next_step": "下次分析前调用getRecentReviews对比上次判断",
+                "privacy_note": "仅保存股票代码、判断、关键点位和复盘标签，不保存券商账户凭据",
+            },
+            source=self.source,
+        )
+
+    def recent_reviews(self, code: str | None = None, limit: int = 10) -> dict[str, Any]:
+        normalized_code = normalize_code(code or "")
+        records = self._read_review_records()
+        if normalized_code:
+            records = [record for record in records if normalize_code(record.get("code", "")) == normalized_code]
+        records = sorted(records, key=lambda item: str(item.get("created_at", "")), reverse=True)[: max(1, limit)]
+        return response_envelope(
+            {
+                "records": records,
+                "must_compare_with_current_analysis": True,
+                "comparison_prompt": "请对比上次判断、当前价格/板块/技术结构变化，并说明上次判断是否仍成立",
+            },
+            source=self.source,
+        )
+
+    def evaluate_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        review_id = str(payload.get("review_id", "") or "")
+        records = self._read_review_records()
+        matched_index = next((index for index, item in enumerate(records) if item.get("review_id") == review_id), None)
+        if matched_index is None:
+            return response_envelope({"error": "review_id not found"}, source=self.source, freshness="unavailable")
+        evaluation = {
+            "evaluated_at": fetched_at(),
+            "actual_outcome": str(payload.get("actual_outcome", "") or ""),
+            "actual_action": str(payload.get("actual_action", "") or ""),
+            "triggered_failure_line": bool(payload.get("triggered_failure_line", False)),
+            "triggered_buy_condition": bool(payload.get("triggered_buy_condition", False)),
+            "lesson_tags": payload.get("lesson_tags") if isinstance(payload.get("lesson_tags"), list) else [],
+            "outcome_rating": str(payload.get("outcome_rating", "") or "未评级"),
+            "outcome_note": str(payload.get("outcome_note", "") or ""),
+        }
+        records[matched_index]["status"] = "evaluated"
+        records[matched_index]["updated_at"] = evaluation["evaluated_at"]
+        records[matched_index]["evaluation"] = evaluation
+        self._write_review_records(records)
+        return response_envelope(
+            {
+                "record": records[matched_index],
+                "next_step": "后续分析前调用getReviewLessons，避免重复同类错误或忽略有效经验",
+            },
+            source=self.source,
+        )
+
+    def review_lessons(self, limit: int = 20) -> dict[str, Any]:
+        records = self._read_review_records()
+        evaluated = [record for record in records if isinstance(record.get("evaluation"), dict)]
+        lesson_counts: dict[str, int] = {}
+        latest_lessons: list[dict[str, Any]] = []
+        for record in sorted(evaluated, key=lambda item: str(item.get("updated_at", "")), reverse=True):
+            evaluation = record.get("evaluation") or {}
+            tags = evaluation.get("lesson_tags") if isinstance(evaluation.get("lesson_tags"), list) else []
+            for tag in tags:
+                lesson_counts[str(tag)] = lesson_counts.get(str(tag), 0) + 1
+            latest_lessons.append(
+                {
+                    "code": record.get("code"),
+                    "name": record.get("name"),
+                    "decision": record.get("decision"),
+                    "outcome_rating": evaluation.get("outcome_rating"),
+                    "lesson_tags": tags,
+                    "actual_outcome": evaluation.get("actual_outcome"),
+                }
+            )
+        return response_envelope(
+            {
+                "lesson_counts": lesson_counts,
+                "latest_lessons": latest_lessons[: max(1, limit)],
+                "usage_rule": "分析前先读这些lesson；若当前情形相似，必须说明本次是否沿用或反驳历史经验",
+            },
+            source=self.source,
+        )
 
     def _unavailable(self, exc: Exception) -> dict[str, Any]:
         return response_envelope({"error": f"{type(exc).__name__}: {exc}"}, source=self.source, freshness="unavailable")
@@ -2620,5 +2749,21 @@ def create_app(service: MarketDataService | None = None):
     @app.post("/portfolio/analyze")
     def portfolio_analyze(payload: dict[str, Any]):
         return service.portfolio_analyze(payload)
+
+    @app.post("/reviews/log")
+    def reviews_log(payload: dict[str, Any]):
+        return service.log_review(payload)
+
+    @app.get("/reviews/recent")
+    def reviews_recent(code: str | None = None, limit: int = 10):
+        return service.recent_reviews(code=code, limit=limit)
+
+    @app.post("/reviews/evaluate")
+    def reviews_evaluate(payload: dict[str, Any]):
+        return service.evaluate_review(payload)
+
+    @app.get("/reviews/lessons")
+    def reviews_lessons(limit: int = 20):
+        return service.review_lessons(limit=limit)
 
     return app

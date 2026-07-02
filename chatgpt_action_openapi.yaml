@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: A Share Market Data Service
   version: 0.1.0
-  description: 获取A股实时大盘、个股报价、盘口、板块、技术点位和持仓分析数据。
+  description: 获取A股实时大盘、个股报价、盘口、板块、技术点位、持仓分析数据和轻量复盘记忆。
 servers:
   - url: https://a-share-market-data-service.onrender.com
     description: Render deployment
@@ -226,3 +226,113 @@ paths:
       responses:
         "200":
           description: 持仓诊断、T+1约束和操作建议
+  /reviews/log:
+    post:
+      operationId: logReview
+      summary: 保存一次股票分析判断到复盘账本
+      description: 分析完成后调用，保存股票代码、判断、关键点位、风险标签和数据来源，用于下次分析前对比。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                code:
+                  type: string
+                name:
+                  type: string
+                decision:
+                  type: string
+                  description: 本次判断，例如反抽不过21.34减仓
+                decision_score:
+                  type: number
+                freshness:
+                  type: string
+                key_levels:
+                  type: object
+                  description: failure_line、buy_trigger、turnaround等关键点位
+                risk_tags:
+                  type: array
+                  items:
+                    type: string
+                source:
+                  type: string
+              required:
+                - code
+                - decision
+      responses:
+        "200":
+          description: 已保存的复盘记录和下次分析提示
+  /reviews/recent:
+    get:
+      operationId: getRecentReviews
+      summary: 读取最近复盘记录
+      description: 分析某只股票或组合前调用，用于对比上次判断是否仍成立。
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema:
+            type: string
+          description: 可选，6位股票代码；不传则读取最近全部记录
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: 最近复盘记录、对比提示和是否必须对比当前分析
+  /reviews/evaluate:
+    post:
+      operationId: evaluateReview
+      summary: 评估一条历史判断
+      description: 盘后或次日复盘时调用，记录实际走势、实际动作、是否触发买入或失败线，并沉淀lesson标签。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                review_id:
+                  type: string
+                actual_outcome:
+                  type: string
+                actual_action:
+                  type: string
+                triggered_failure_line:
+                  type: boolean
+                triggered_buy_condition:
+                  type: boolean
+                lesson_tags:
+                  type: array
+                  items:
+                    type: string
+                outcome_rating:
+                  type: string
+                  description: 有效、无效、部分有效、待观察
+                outcome_note:
+                  type: string
+              required:
+                - review_id
+      responses:
+        "200":
+          description: 已评估的复盘记录和下一步经验使用提示
+  /reviews/lessons:
+    get:
+      operationId: getReviewLessons
+      summary: 获取复盘经验总结
+      description: 分析前调用，读取历史lesson标签和最近经验，提醒GPT避免重复错误或沿用有效经验。
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: lesson统计、最近经验和使用规则

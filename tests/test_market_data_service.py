@@ -478,6 +478,50 @@ def test_verify_candidates_marks_repeated_names_as_tracking_not_new_recommendati
     assert "没有新的实时证据" in item["candidate_lifecycle"]["duplicate_note"]
 
 
+def test_review_ledger_logs_reads_evaluates_and_summarizes_lessons(tmp_path) -> None:
+    service = MarketDataService(provider=StaticMarketDataProvider(), review_store_path=tmp_path / "reviews.json")
+
+    logged = service.log_review(
+        {
+            "code": "600879",
+            "name": "航天电子",
+            "decision": "反抽不过21.34减仓",
+            "decision_score": 65,
+            "freshness": "live",
+            "key_levels": {"failure_line": 20.99, "turnaround": 21.34},
+            "risk_tags": ["低于分时均价", "板块不强"],
+            "source": "getStockIntradayAnalysis",
+        }
+    )
+
+    assert logged["data"]["record"]["code"] == "600879"
+    assert logged["data"]["record"]["status"] == "open"
+    assert logged["data"]["next_step"] == "下次分析前调用getRecentReviews对比上次判断"
+
+    recent = service.recent_reviews(code="600879", limit=5)
+    assert recent["data"]["records"][0]["decision"] == "反抽不过21.34减仓"
+    assert recent["data"]["must_compare_with_current_analysis"] is True
+
+    evaluated = service.evaluate_review(
+        {
+            "review_id": logged["data"]["record"]["review_id"],
+            "actual_outcome": "次日低开后继续走弱，减仓判断有效",
+            "actual_action": "卖出100股",
+            "triggered_failure_line": True,
+            "triggered_buy_condition": False,
+            "lesson_tags": ["风险线有效", "弱板块不恋战"],
+            "outcome_rating": "有效",
+        }
+    )
+
+    assert evaluated["data"]["record"]["status"] == "evaluated"
+    assert evaluated["data"]["record"]["evaluation"]["outcome_rating"] == "有效"
+
+    lessons = service.review_lessons(limit=10)
+    assert lessons["data"]["lesson_counts"]["风险线有效"] == 1
+    assert lessons["data"]["latest_lessons"][0]["code"] == "600879"
+
+
 def test_stock_intraday_analysis_does_not_invent_unmatched_board() -> None:
     provider = StaticMarketDataProvider(
         quotes=pd.DataFrame([{"代码": "002100", "名称": "天康生物", "最新价": 8.76, "涨跌幅": 1.0}]),
@@ -855,3 +899,45 @@ def test_privacy_endpoint_returns_plain_policy_page() -> None:
     assert response.status_code == 200
     assert "A股实时持仓分析助手隐私政策" in response.text
     assert "不要求用户提供 API key" in response.text
+
+
+def test_review_routes_support_gpt_action_memory_loop(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    service = MarketDataService(provider=StaticMarketDataProvider(), review_store_path=tmp_path / "reviews.json")
+    client = TestClient(create_app(service=service))
+
+    log_response = client.post(
+        "/reviews/log",
+        json={
+            "code": "000725",
+            "name": "京东方A",
+            "decision": "9.20站不回则减仓",
+            "decision_score": 62,
+            "risk_tags": ["分时偏弱"],
+        },
+    )
+
+    assert log_response.status_code == 200
+    review_id = log_response.json()["data"]["record"]["review_id"]
+
+    recent_response = client.get("/reviews/recent", params={"code": "000725", "limit": 3})
+    assert recent_response.status_code == 200
+    assert recent_response.json()["data"]["records"][0]["review_id"] == review_id
+
+    evaluate_response = client.post(
+        "/reviews/evaluate",
+        json={
+            "review_id": review_id,
+            "actual_outcome": "未站回9.20后继续走弱",
+            "actual_action": "减仓",
+            "lesson_tags": ["均价下方不恋战"],
+            "outcome_rating": "有效",
+        },
+    )
+    assert evaluate_response.status_code == 200
+    assert evaluate_response.json()["data"]["record"]["status"] == "evaluated"
+
+    lessons_response = client.get("/reviews/lessons")
+    assert lessons_response.status_code == 200
+    assert lessons_response.json()["data"]["lesson_counts"]["均价下方不恋战"] == 1
