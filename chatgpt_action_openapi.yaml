@@ -73,6 +73,58 @@ paths:
       responses:
         "200":
           description: MA、RSI、MACD、买入点、卖出点、止损点和来源
+  /stock/intraday-analysis:
+    post:
+      operationId: getStockIntradayAnalysis
+      summary: 获取单只股票盘中交易分析数据结构
+      description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、板块、市场状态、涨停池关联和账户约束，用于盘中买卖点判断。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                code:
+                  type: string
+                  description: 6位股票代码，例如 002100
+                intraday_limit:
+                  type: integer
+                  description: 可选，只返回最近N条1分钟分时
+                trade_limit:
+                  type: integer
+                  description: 可选，只返回最近N笔成交明细
+                include_market_breadth:
+                  type: boolean
+                  description: 是否在单票深挖时同时抓全市场涨跌家数；默认false以避免免费云服务超时，需要完整市场广度时优先单独调用getMarketSnapshot
+                account:
+                  type: object
+                  description: 用户账户约束，可由截图或手工输入转换而来
+                  properties:
+                    cash:
+                      type: number
+                    total_asset:
+                      type: number
+                    positions:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          code:
+                            type: string
+                          name:
+                            type: string
+                          shares:
+                            type: integer
+                          available:
+                            type: integer
+                          cost:
+                            type: number
+              required:
+                - code
+      responses:
+        "200":
+          description: 单票盘中交易分析用完整数据结构和数据质量标记
   /candidates/actionable:
     get:
       operationId: getActionableCandidates

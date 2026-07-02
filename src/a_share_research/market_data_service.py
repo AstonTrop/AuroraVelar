@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any
 import re
 
@@ -75,6 +75,76 @@ def _quote_col(df: pd.DataFrame, *names: str) -> str | None:
         if name in df.columns:
             return name
     return None
+
+
+def _first_row(df: pd.DataFrame) -> dict[str, Any]:
+    if df is None or df.empty:
+        return {}
+    return df.iloc[0].to_dict()
+
+
+def _pick(row: dict[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        if name in row:
+            value = row.get(name)
+            try:
+                if pd.isna(value):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return value
+    return default
+
+
+def _nullable_float(value: object) -> float | None:
+    parsed = parse_numeric(value)
+    if pd.isna(parsed):
+        return None
+    return float(parsed)
+
+
+def _nullable_int(value: object) -> int | None:
+    parsed = parse_numeric(value)
+    if pd.isna(parsed):
+        return None
+    return int(float(parsed))
+
+
+def stock_market(code: str) -> str | None:
+    code = normalize_code(code)
+    if not code:
+        return None
+    if code.startswith(("6", "5", "9")):
+        return "SH"
+    if code.startswith(("0", "2", "3")):
+        return "SZ"
+    if code.startswith(("4", "8")):
+        return "BJ"
+    return None
+
+
+def trading_phase(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return "non_trading_day"
+    current = now.time()
+    if current < time(9, 30):
+        return "pre_open"
+    if time(9, 30) <= current <= time(11, 30) or time(13, 0) <= current <= time(15, 0):
+        return "continuous_auction"
+    if time(11, 30) < current < time(13, 0):
+        return "lunch_break"
+    return "after_close"
+
+
+def freshness_for_phase(phase: str) -> str:
+    if phase == "continuous_auction":
+        return "live"
+    if phase in {"lunch_break", "after_close"}:
+        return "after_close"
+    if phase == "pre_open":
+        return "delayed"
+    return "delayed"
 
 
 def normalize_quotes_df(quotes_df: pd.DataFrame) -> pd.DataFrame:
@@ -182,6 +252,16 @@ class AkshareMarketDataProvider:
             adjust="qfq",
         )
 
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        raise RuntimeError("AkShare intraday method is not enabled for this service")
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        raise RuntimeError("AkShare recent-trades method is not enabled for this service")
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        report_date = report_date or date.today()
+        return self._ak().stock_zt_pool_em(date=report_date.strftime("%Y%m%d"))
+
 
 class EastmoneyDirectMarketDataProvider:
     source = EASTMONEY_DIRECT_SOURCE
@@ -266,6 +346,15 @@ class EastmoneyDirectMarketDataProvider:
 
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         raise RuntimeError("Eastmoney direct fallback does not provide historical bars")
+
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback does not provide intraday bars")
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback does not provide recent trades")
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        raise RuntimeError("Eastmoney direct fallback does not provide limit-up pool")
 
 
 class SinaMarketDataProvider:
@@ -436,6 +525,53 @@ class SinaMarketDataProvider:
                 out[col] = pd.to_numeric(out[col], errors="coerce")
         return out
 
+    def _fetch_intraday(self, *, symbol: str, datalen: int) -> list[dict[str, Any]]:
+        response = requests.get(
+            "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
+            params={"symbol": symbol, "scale": 1, "ma": "no", "datalen": datalen},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        code = normalize_code(code)
+        symbol = _tencent_symbol(code)
+        rows = self._fetch_intraday(symbol=symbol, datalen=limit or 260)
+        out = pd.DataFrame.from_records(rows)
+        if out.empty:
+            return out
+        rename_map = {
+            "day": "time",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        }
+        out = out.rename(columns=rename_map)
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce")
+        if "amount" not in out.columns:
+            out["amount"] = out["close"] * out["volume"]
+        if "price" not in out.columns:
+            out["price"] = out["close"]
+        cumulative_volume = out["volume"].cumsum().replace(0, pd.NA)
+        cumulative_amount = out["amount"].cumsum()
+        out["avg_price"] = cumulative_amount / cumulative_volume
+        if limit:
+            out = out.tail(limit)
+        return out[["time", "price", "avg_price", "open", "high", "low", "close", "volume", "amount"]].copy()
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        raise RuntimeError("Sina market-center fallback does not provide stable recent trades")
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        raise RuntimeError("Sina market-center fallback does not provide limit-up pool")
+
 
 def _tencent_symbol(code: str, *, compact_index: bool = False) -> str:
     code = normalize_code(code)
@@ -490,10 +626,18 @@ class TencentMarketDataProvider:
                     "代码": normalize_code(row[2]),
                     "名称": row[1],
                     "最新价": parse_numeric(row[3]),
+                    "昨收": parse_numeric(row[4]) if len(row) > 4 else float("nan"),
+                    "今开": parse_numeric(row[5]) if len(row) > 5 else float("nan"),
+                    "成交量": parse_numeric(row[36]) if len(row) > 36 else float("nan"),
+                    "涨跌额": parse_numeric(row[31]) if len(row) > 31 else float("nan"),
                     "涨跌幅": parse_numeric(row[32]) if len(row) > 32 else float("nan"),
-                    "成交额": parse_numeric(row[38]) if len(row) > 38 else float("nan"),
+                    "最高": parse_numeric(row[33]) if len(row) > 33 else float("nan"),
+                    "最低": parse_numeric(row[34]) if len(row) > 34 else float("nan"),
+                    "成交额": parse_numeric(row[37]) if len(row) > 37 else float("nan"),
                     "换手率": parse_numeric(row[38]) if len(row) > 38 else float("nan"),
                     "量比": parse_numeric(row[49]) if len(row) > 49 else float("nan"),
+                    "涨停价": parse_numeric(row[47]) if len(row) > 47 else float("nan"),
+                    "跌停价": parse_numeric(row[48]) if len(row) > 48 else float("nan"),
                 }
             )
         return pd.DataFrame.from_records(records)
@@ -529,7 +673,25 @@ class TencentMarketDataProvider:
             "最新": parse_numeric(row[3]) if len(row) > 3 else float("nan"),
             "涨幅": parse_numeric(row[32]) if len(row) > 32 else float("nan"),
             "buy_1": parse_numeric(row[9]) if len(row) > 9 else float("nan"),
+            "buy_1_volume": parse_numeric(row[10]) if len(row) > 10 else float("nan"),
+            "buy_2": parse_numeric(row[11]) if len(row) > 11 else float("nan"),
+            "buy_2_volume": parse_numeric(row[12]) if len(row) > 12 else float("nan"),
+            "buy_3": parse_numeric(row[13]) if len(row) > 13 else float("nan"),
+            "buy_3_volume": parse_numeric(row[14]) if len(row) > 14 else float("nan"),
+            "buy_4": parse_numeric(row[15]) if len(row) > 15 else float("nan"),
+            "buy_4_volume": parse_numeric(row[16]) if len(row) > 16 else float("nan"),
+            "buy_5": parse_numeric(row[17]) if len(row) > 17 else float("nan"),
+            "buy_5_volume": parse_numeric(row[18]) if len(row) > 18 else float("nan"),
             "sell_1": parse_numeric(row[19]) if len(row) > 19 else float("nan"),
+            "sell_1_volume": parse_numeric(row[20]) if len(row) > 20 else float("nan"),
+            "sell_2": parse_numeric(row[21]) if len(row) > 21 else float("nan"),
+            "sell_2_volume": parse_numeric(row[22]) if len(row) > 22 else float("nan"),
+            "sell_3": parse_numeric(row[23]) if len(row) > 23 else float("nan"),
+            "sell_3_volume": parse_numeric(row[24]) if len(row) > 24 else float("nan"),
+            "sell_4": parse_numeric(row[25]) if len(row) > 25 else float("nan"),
+            "sell_4_volume": parse_numeric(row[26]) if len(row) > 26 else float("nan"),
+            "sell_5": parse_numeric(row[27]) if len(row) > 27 else float("nan"),
+            "sell_5_volume": parse_numeric(row[28]) if len(row) > 28 else float("nan"),
         }
         return pd.DataFrame([{"item": key, "value": value} for key, value in data.items()])
 
@@ -538,6 +700,15 @@ class TencentMarketDataProvider:
 
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         raise RuntimeError("Tencent fallback does not provide historical bars")
+
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        raise RuntimeError("Tencent fallback does not provide intraday bars")
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        raise RuntimeError("Tencent fallback does not provide stable recent trades")
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        raise RuntimeError("Tencent fallback does not provide limit-up pool")
 
 
 class FallbackMarketDataProvider:
@@ -586,6 +757,15 @@ class FallbackMarketDataProvider:
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         return self._with_fallback("hist", code, report_date=report_date)
 
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        return self._with_fallback("intraday_1m", code, limit=limit)
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        return self._with_fallback("recent_trades", code, limit=limit)
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        return self._with_fallback("zt_pool", report_date=report_date)
+
 
 class CloudMarketDataProvider:
     """Route each endpoint to the lightest reliable public data source."""
@@ -597,6 +777,7 @@ class CloudMarketDataProvider:
         realtime_provider: Any | None = None,
         board_provider: Any | None = None,
         history_provider: Any | None = None,
+        zt_provider: Any | None = None,
     ) -> None:
         akshare = AkshareMarketDataProvider()
         tencent = TencentMarketDataProvider()
@@ -617,11 +798,13 @@ class CloudMarketDataProvider:
             primary=sina,
             fallback=akshare,
         )
+        self.zt_provider = zt_provider or akshare
         sources = [
             getattr(self.full_market_provider, "source", EASTMONEY_DIRECT_SOURCE),
             getattr(self.realtime_provider, "source", TENCENT_SOURCE),
             getattr(self.board_provider, "source", SINA_SOURCE),
             getattr(self.history_provider, "source", SINA_SOURCE),
+            getattr(self.zt_provider, "source", DEFAULT_SOURCE),
         ]
         self.source = "+".join(dict.fromkeys(str(source) for source in sources))
 
@@ -643,6 +826,15 @@ class CloudMarketDataProvider:
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         return self.history_provider.hist(code, report_date=report_date)
 
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        return self.history_provider.intraday_1m(code, limit=limit)
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        return self.realtime_provider.recent_trades(code, limit=limit)
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        return self.zt_provider.zt_pool(report_date=report_date)
+
 
 def create_default_provider() -> CloudMarketDataProvider:
     return CloudMarketDataProvider()
@@ -658,12 +850,18 @@ class StaticMarketDataProvider:
         bidasks: dict[str, pd.DataFrame] | None = None,
         boards_df: pd.DataFrame | None = None,
         hist: dict[str, pd.DataFrame] | None = None,
+        intraday: dict[str, pd.DataFrame] | None = None,
+        recent_trades: dict[str, pd.DataFrame] | None = None,
+        zt_pool: pd.DataFrame | None = None,
     ) -> None:
         self.quotes_df = quotes.copy() if quotes is not None else pd.DataFrame()
         self.indices_df = indices.copy() if indices is not None else pd.DataFrame()
         self.bidasks = bidasks or {}
         self.boards_df = boards_df.copy() if boards_df is not None else pd.DataFrame()
         self.hist_map = hist or {}
+        self.intraday_map = intraday or {}
+        self.recent_trades_map = recent_trades or {}
+        self.zt_pool_df = zt_pool.copy() if zt_pool is not None else pd.DataFrame()
 
     def quotes(self) -> pd.DataFrame:
         return self.quotes_df.copy()
@@ -688,6 +886,109 @@ class StaticMarketDataProvider:
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         return self.hist_map.get(normalize_code(code), pd.DataFrame()).copy()
 
+    def intraday_1m(self, code: str, limit: int | None = None) -> pd.DataFrame:
+        out = self.intraday_map.get(normalize_code(code), pd.DataFrame()).copy()
+        return out.tail(limit).copy() if limit and not out.empty else out
+
+    def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+        out = self.recent_trades_map.get(normalize_code(code), pd.DataFrame()).copy()
+        return out.head(limit).copy() if limit and not out.empty else out
+
+    def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
+        return self.zt_pool_df.copy()
+
+
+def calculate_intraday_technical_indicators(hist_df: pd.DataFrame) -> dict[str, Any]:
+    if hist_df is None or hist_df.empty:
+        return {key: None for key in [
+            "ma5",
+            "ma10",
+            "ma20",
+            "ma60",
+            "macd_dif",
+            "macd_dea",
+            "macd_hist",
+            "rsi6",
+            "rsi12",
+            "rsi24",
+            "boll_upper",
+            "boll_mid",
+            "boll_lower",
+            "recent_high_20",
+            "recent_low_20",
+            "volume_ma5",
+            "volume_ma10",
+            "atr",
+            "platform_support",
+            "platform_resistance",
+        ]}
+    work = hist_df.copy()
+    close_col = _quote_col(work, "收盘", "close", "最新价")
+    high_col = _quote_col(work, "最高", "high")
+    low_col = _quote_col(work, "最低", "low")
+    volume_col = _quote_col(work, "成交量", "volume")
+    close = pd.to_numeric(work[close_col], errors="coerce") if close_col else pd.Series(dtype="float64")
+    high = pd.to_numeric(work[high_col], errors="coerce") if high_col else close
+    low = pd.to_numeric(work[low_col], errors="coerce") if low_col else close
+    volume = pd.to_numeric(work[volume_col], errors="coerce") if volume_col else pd.Series([float("nan")] * len(close))
+
+    def last(series: pd.Series) -> float | None:
+        if series.empty:
+            return None
+        value = series.iloc[-1]
+        if pd.isna(value):
+            return None
+        return round(float(value), 4)
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    macd_hist = (dif - dea) * 2
+
+    def rsi(period: int) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        rs = gain / loss.replace(0, pd.NA)
+        return 100 - (100 / (1 + rs))
+
+    ma20 = close.rolling(20).mean()
+    boll_std = close.rolling(20).std()
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    recent_low_20 = low.rolling(20).min()
+    recent_high_20 = high.rolling(20).max()
+    return {
+        "ma5": last(close.rolling(5).mean()),
+        "ma10": last(close.rolling(10).mean()),
+        "ma20": last(ma20),
+        "ma60": last(close.rolling(60).mean()),
+        "macd_dif": last(dif),
+        "macd_dea": last(dea),
+        "macd_hist": last(macd_hist),
+        "rsi6": last(rsi(6)),
+        "rsi12": last(rsi(12)),
+        "rsi24": last(rsi(24)),
+        "boll_upper": last(ma20 + 2 * boll_std),
+        "boll_mid": last(ma20),
+        "boll_lower": last(ma20 - 2 * boll_std),
+        "recent_high_20": last(recent_high_20),
+        "recent_low_20": last(recent_low_20),
+        "volume_ma5": last(volume.rolling(5).mean()),
+        "volume_ma10": last(volume.rolling(10).mean()),
+        "atr": last(true_range.rolling(14).mean()),
+        "platform_support": last(recent_low_20),
+        "platform_resistance": last(recent_high_20),
+    }
+
 
 class MarketDataService:
     def __init__(self, provider: Any | None = None) -> None:
@@ -702,6 +1003,466 @@ class MarketDataService:
 
     def health(self) -> dict[str, Any]:
         return response_envelope({"status": "ok", "provider": self.source}, source=self.source)
+
+    def _module_failed(self, exc: Exception) -> dict[str, Any]:
+        return {"status": "failed", "fetched_at": fetched_at(), "error": f"{type(exc).__name__}: {exc}"}
+
+    def _quote_detail(self, code: str) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        quote_df = self.provider.quotes_for([code]) if hasattr(self.provider, "quotes_for") else self.provider.quotes()
+        row = _first_row(quote_df)
+        if not row:
+            raise RuntimeError("No quote data returned")
+        latest_price = _nullable_float(_pick(row, "最新价", "latest_price", "last_price", "现价"))
+        pre_close = _nullable_float(_pick(row, "昨收", "pre_close", "昨收价"))
+        change = _nullable_float(_pick(row, "涨跌额", "change"))
+        if change is None and latest_price is not None and pre_close is not None:
+            change = round(latest_price - pre_close, 4)
+        return {
+            "status": "ok",
+            "fetched_at": fetched_time,
+            "code": normalize_code(_pick(row, "代码", "code", default=code)),
+            "name": str(_pick(row, "名称", "name", default="") or ""),
+            "market": stock_market(code),
+            "latest_price": latest_price,
+            "change": change,
+            "change_pct": _nullable_float(_pick(row, "涨跌幅", "change_pct", "day_change_pct")),
+            "pre_close": pre_close,
+            "open": _nullable_float(_pick(row, "今开", "开盘", "open")),
+            "high": _nullable_float(_pick(row, "最高", "high")),
+            "low": _nullable_float(_pick(row, "最低", "low")),
+            "turnover_rate": _nullable_float(_pick(row, "换手率", "turnover_rate")),
+            "volume_ratio": _nullable_float(_pick(row, "量比", "volume_ratio")),
+            "volume": _nullable_float(_pick(row, "成交量", "volume")),
+            "volume_unit": "股",
+            "amount": _nullable_float(_pick(row, "成交额", "amount")),
+            "amount_unit": "元",
+            "total_market_cap": _nullable_float(_pick(row, "总市值", "total_market_cap")),
+            "circulating_market_cap": _nullable_float(_pick(row, "流通市值", "circulating_market_cap")),
+            "limit_up_price": _nullable_float(_pick(row, "涨停价", "limit_up_price")),
+            "limit_down_price": _nullable_float(_pick(row, "跌停价", "limit_down_price")),
+            "amplitude": _nullable_float(_pick(row, "振幅", "amplitude")),
+        }
+
+    def _intraday_rows(self, code: str, limit: int | None = None) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        intraday_df = self.provider.intraday_1m(code, limit=limit)
+        if intraday_df is None or intraday_df.empty:
+            return {"status": "failed", "fetched_at": fetched_time, "rows": [], "error": "No intraday data returned"}
+        rows = []
+        for _, row in intraday_df.iterrows():
+            rows.append(
+                {
+                    "time": str(_pick(row.to_dict(), "time", "时间", default="")),
+                    "price": _nullable_float(_pick(row.to_dict(), "price", "close", "收盘")),
+                    "avg_price": _nullable_float(_pick(row.to_dict(), "avg_price", "vwap", "均价")),
+                    "vwap": _nullable_float(_pick(row.to_dict(), "vwap", "avg_price", "均价")),
+                    "open": _nullable_float(_pick(row.to_dict(), "open", "开盘")),
+                    "high": _nullable_float(_pick(row.to_dict(), "high", "最高")),
+                    "low": _nullable_float(_pick(row.to_dict(), "low", "最低")),
+                    "close": _nullable_float(_pick(row.to_dict(), "close", "收盘", "price")),
+                    "volume": _nullable_float(_pick(row.to_dict(), "volume", "成交量")),
+                    "volume_unit": "股",
+                    "amount": _nullable_float(_pick(row.to_dict(), "amount", "成交额")),
+                    "amount_unit": "元",
+                }
+            )
+        return {"status": "ok", "fetched_at": fetched_time, "rows": rows}
+
+    def _order_book_5(self, code: str, cash: float | None = None) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        raw = _bid_ask_to_dict(self.provider.bid_ask(code))
+        if not raw:
+            return {"status": "failed", "fetched_at": fetched_time, "bid": [], "ask": [], "error": "No bid/ask data returned"}
+        bid = []
+        ask = []
+        for level in range(1, 6):
+            bid_price = _nullable_float(raw.get(f"buy_{level}"))
+            ask_price = _nullable_float(raw.get(f"sell_{level}"))
+            if bid_price is not None:
+                bid.append({"price": bid_price, "volume": _nullable_float(raw.get(f"buy_{level}_volume"))})
+            if ask_price is not None:
+                ask.append({"price": ask_price, "volume": _nullable_float(raw.get(f"sell_{level}_volume"))})
+        latest_price = _safe_float(raw.get("最新"))
+        day_change_pct = _safe_float(raw.get("涨幅"), 0.0)
+        sell_1 = _safe_float(raw.get("sell_1"))
+        buy_1 = _safe_float(raw.get("buy_1"))
+        action = classify_bid_ask_actionability(
+            latest_price=latest_price,
+            day_change_pct=day_change_pct,
+            sell_1=sell_1,
+            buy_1=buy_1,
+            cash=cash,
+        )
+        spread = None
+        if bid and ask and bid[0]["price"] is not None and ask[0]["price"] is not None:
+            spread = round(float(ask[0]["price"]) - float(bid[0]["price"]), 4)
+        seal_amount = None
+        if action["is_limit_up_sealed"] and bid:
+            seal_amount = (bid[0]["price"] or 0) * (bid[0]["volume"] or 0)
+        return {
+            "status": "ok",
+            "fetched_at": fetched_time,
+            "time": fetched_time.split(" ")[1],
+            "bid": bid,
+            "ask": ask,
+            "spread": spread,
+            "volume_unit": "股",
+            "is_limit_up": bool(day_change_pct >= 9.7),
+            "is_limit_down": bool(day_change_pct <= -9.7),
+            "is_limit_up_sealed": action["is_limit_up_sealed"],
+            "seal_amount": seal_amount,
+            "seal_ratio_to_amount": None,
+            "seal_ratio_to_float_mcap": None,
+            "actionability": action["actionability"],
+            "min_lot_cost": action["min_lot_cost"],
+        }
+
+    def _recent_trade_rows(self, code: str, limit: int = 100) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        trade_df = self.provider.recent_trades(code, limit=limit)
+        if trade_df is None or trade_df.empty:
+            return {"status": "failed", "fetched_at": fetched_time, "rows": [], "error": "No recent trade data returned"}
+        rows = []
+        for _, row in trade_df.iterrows():
+            row_dict = row.to_dict()
+            amount = _nullable_float(_pick(row_dict, "amount", "成交额"))
+            price = _nullable_float(_pick(row_dict, "price", "成交价"))
+            volume = _nullable_float(_pick(row_dict, "volume", "成交量"))
+            if amount is None and price is not None and volume is not None:
+                amount = price * volume
+            rows.append(
+                {
+                    "time": str(_pick(row_dict, "time", "成交时间", default="")),
+                    "price": price,
+                    "volume": volume,
+                    "volume_unit": "股",
+                    "amount": amount,
+                    "amount_unit": "元",
+                    "side": str(_pick(row_dict, "side", "方向", default="unknown") or "unknown"),
+                    "large_order_flag": bool(amount is not None and amount >= 500000),
+                }
+            )
+        return {"status": "ok", "fetched_at": fetched_time, "rows": rows}
+
+    def _technical_indicators(self, code: str) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        hist_df = self.provider.hist(code)
+        if hist_df is None or hist_df.empty:
+            return {"status": "failed", "fetched_at": fetched_time, "error": "No daily history returned"}
+        return {"status": "ok", "fetched_at": fetched_time, **calculate_intraday_technical_indicators(hist_df)}
+
+    def _board_context(self, code: str) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        board_df = self.provider.boards()
+        if board_df is None or board_df.empty:
+            return {"status": "failed", "fetched_at": fetched_time, "industry": None, "concepts": [], "core_stocks": [], "error": "No board data returned"}
+        work = board_df.copy()
+        if "board_name" not in work.columns:
+            work = normalize_board_snapshot(work, "board", "provider")
+        code = normalize_code(code)
+        leader_col = _quote_col(work, "leader_code", "领涨股代码")
+        matched = pd.DataFrame()
+        if leader_col:
+            matched = work[work[leader_col].map(normalize_code).eq(code)]
+            if not matched.empty:
+                work = pd.concat([matched, work.drop(matched.index)], ignore_index=True)
+        if leader_col and matched.empty:
+            return {
+                "status": "partial",
+                "fetched_at": fetched_time,
+                "industry": None,
+                "concepts": [],
+                "core_stocks": [],
+                "error": "Stock-to-board mapping is unavailable from current public board source",
+            }
+        industry_rows = work[work.get("board_type", "").astype(str).str.contains("行业", na=False)] if "board_type" in work.columns else pd.DataFrame()
+        concept_rows = work[work.get("board_type", "").astype(str).str.contains("概念", na=False)] if "board_type" in work.columns else pd.DataFrame()
+        industry_row = _first_row(industry_rows if not industry_rows.empty else work)
+
+        def board_item(row: dict[str, Any]) -> dict[str, Any]:
+            up_count = _nullable_float(_pick(row, "up_count", "上涨家数"))
+            down_count = _nullable_float(_pick(row, "down_count", "下跌家数"))
+            up_ratio = None
+            if up_count is not None and down_count is not None and up_count + down_count > 0:
+                up_ratio = round(up_count / (up_count + down_count), 4)
+            return {
+                "name": str(_pick(row, "board_name", "板块名称", default="") or ""),
+                "change_pct": _nullable_float(_pick(row, "change_pct", "涨跌幅")),
+                "rank": _nullable_int(_pick(row, "rank", "排名")),
+                "amount": _nullable_float(_pick(row, "amount", "成交额")),
+                "turnover_rate": _nullable_float(_pick(row, "turnover_rate", "换手率")),
+                "main_net_inflow": _nullable_float(_pick(row, "main_net_inflow", "主力净流入")),
+                "up_count": up_count,
+                "down_count": down_count,
+                "up_ratio": up_ratio,
+                "leader_code": normalize_code(_pick(row, "leader_code", "领涨股代码", default="")),
+                "leader_name": str(_pick(row, "leader", "leader_name", "领涨股", default="") or ""),
+                "leader_change_pct": _nullable_float(_pick(row, "leader_change_pct", "领涨股涨跌幅")),
+                "limit_up_count": _nullable_int(_pick(row, "limit_up_count", "涨停家数")),
+            }
+
+        concepts = [board_item(row.to_dict()) for _, row in concept_rows.head(5).iterrows()]
+        core_stocks = []
+        for row in work.head(5).to_dict(orient="records"):
+            leader_code = normalize_code(_pick(row, "leader_code", "领涨股代码", default=""))
+            leader_name = str(_pick(row, "leader", "leader_name", "领涨股", default="") or "")
+            if leader_code or leader_name:
+                core_stocks.append({"code": leader_code, "name": leader_name, "role": "leader"})
+        return {
+            "status": "ok",
+            "fetched_at": fetched_time,
+            "industry": board_item(industry_row) if industry_row else None,
+            "concepts": concepts,
+            "core_stocks": core_stocks,
+        }
+
+    def _market_context(self, *, include_breadth: bool = False) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        phase = trading_phase()
+        if not include_breadth:
+            try:
+                indices = normalize_quotes_df(self.provider.indices()).head(20).to_dict(orient="records")
+            except Exception as exc:  # noqa: BLE001
+                indices = []
+                index_error = f"{type(exc).__name__}: {exc}"
+            else:
+                index_error = None
+            index_map = {item.get("code"): item for item in indices}
+            return {
+                "status": "partial" if index_error else "ok",
+                "fetched_at": fetched_time,
+                "trade_date": datetime.now().strftime("%Y-%m-%d"),
+                "trading_phase": phase,
+                "index": {
+                    "shanghai_change_pct": index_map.get("000001", {}).get("day_change_pct"),
+                    "shenzhen_change_pct": index_map.get("399001", {}).get("day_change_pct"),
+                    "chinext_change_pct": index_map.get("399006", {}).get("day_change_pct"),
+                    "beijing_change_pct": index_map.get("899050", {}).get("day_change_pct"),
+                },
+                "breadth": {
+                    "up_count": None,
+                    "down_count": None,
+                    "flat_count": None,
+                    "limit_up_count": None,
+                    "limit_down_count": None,
+                    "real_limit_up_count": None,
+                    "open_board_count": None,
+                },
+                "amount": {
+                    "total_market_amount": None,
+                    "shanghai_amount": None,
+                    "shenzhen_amount": None,
+                },
+                "risk_mode": "unknown",
+                "error": index_error,
+            }
+        snapshot = self.market_snapshot()
+        data = snapshot.get("data", {})
+        indices = {item.get("code"): item for item in data.get("indices", [])}
+        up_count = data.get("up_count") or 0
+        down_count = data.get("down_count") or 0
+        total = up_count + down_count
+        up_ratio = up_count / total if total else 0
+        risk_mode = "attack" if up_ratio >= 0.62 else "neutral" if up_ratio >= 0.45 else "defense" if total else "unknown"
+        return {
+            "status": "ok" if snapshot.get("freshness") != "unavailable" else "partial",
+            "fetched_at": fetched_time,
+            "trade_date": datetime.now().strftime("%Y-%m-%d"),
+            "trading_phase": phase,
+            "index": {
+                "shanghai_change_pct": indices.get("000001", {}).get("day_change_pct"),
+                "shenzhen_change_pct": indices.get("399001", {}).get("day_change_pct"),
+                "chinext_change_pct": indices.get("399006", {}).get("day_change_pct"),
+                "beijing_change_pct": indices.get("899050", {}).get("day_change_pct"),
+            },
+            "breadth": {
+                "up_count": data.get("up_count"),
+                "down_count": data.get("down_count"),
+                "flat_count": data.get("flat_count"),
+                "limit_up_count": data.get("limit_up_count"),
+                "limit_down_count": data.get("limit_down_count"),
+                "real_limit_up_count": data.get("real_limit_up_count"),
+                "open_board_count": data.get("open_board_count"),
+            },
+            "amount": {
+                "total_market_amount": data.get("total_market_amount"),
+                "shanghai_amount": data.get("shanghai_amount"),
+                "shenzhen_amount": data.get("shenzhen_amount"),
+            },
+            "risk_mode": risk_mode,
+        }
+
+    def _zt_pool_related(self, code: str) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        try:
+            zt_df = self.provider.zt_pool()
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "fetched_at": fetched_time, "related": [], "error": f"{type(exc).__name__}: {exc}"}
+        if zt_df is None or zt_df.empty:
+            return {"status": "partial", "fetched_at": fetched_time, "related": []}
+        code_col = _quote_col(zt_df, "code", "代码")
+        work = zt_df.copy()
+        if code_col:
+            work = work[work[code_col].map(normalize_code).eq(normalize_code(code))]
+        related = []
+        for _, row in work.head(20).iterrows():
+            row_dict = row.to_dict()
+            related.append(
+                {
+                    "code": normalize_code(_pick(row_dict, "code", "代码", default="")),
+                    "name": str(_pick(row_dict, "name", "名称", default="") or ""),
+                    "change_pct": _nullable_float(_pick(row_dict, "change_pct", "涨跌幅")),
+                    "latest_price": _nullable_float(_pick(row_dict, "latest_price", "最新价")),
+                    "limit_up_price": _nullable_float(_pick(row_dict, "limit_up_price", "涨停价")),
+                    "seal_amount": _nullable_float(_pick(row_dict, "seal_amount", "封单资金")),
+                    "first_limit_up_time": _pick(row_dict, "first_limit_up_time", "首次封板时间"),
+                    "last_limit_up_time": _pick(row_dict, "last_limit_up_time", "最后封板时间"),
+                    "open_board_count": _nullable_int(_pick(row_dict, "open_board_count", "炸板次数")),
+                    "continuous_limit_up_count": _nullable_int(_pick(row_dict, "continuous_limit_up_count", "连板数")),
+                    "industry": _pick(row_dict, "industry", "所属行业"),
+                    "concepts": _pick(row_dict, "concepts", default=[]),
+                }
+            )
+        return {"status": "ok", "fetched_at": fetched_time, "related": related}
+
+    def _account_context(self, account: dict[str, Any], quote: dict[str, Any], board: dict[str, Any]) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        positions = []
+        latest = quote.get("latest_price")
+        industry_name = None
+        if isinstance(board.get("industry"), dict):
+            industry_name = board["industry"].get("name")
+        for item in account.get("positions", []) or []:
+            shares = int(float(item.get("shares", 0) or 0))
+            available = int(float(item.get("available", 0) or 0))
+            cost = _nullable_float(item.get("cost"))
+            market_value = latest * shares if latest is not None else None
+            pnl = (latest - cost) * shares if latest is not None and cost is not None else None
+            pnl_pct = ((latest - cost) / cost * 100) if latest is not None and cost not in (None, 0) else None
+            positions.append(
+                {
+                    "code": normalize_code(item.get("code", "")),
+                    "name": item.get("name", ""),
+                    "shares": shares,
+                    "available": available,
+                    "cost": cost,
+                    "latest_price": latest,
+                    "market_value": market_value,
+                    "profit_loss": pnl,
+                    "profit_loss_pct": pnl_pct,
+                    "today_buy_flag": bool(shares > 0 and available < shares),
+                    "sector": item.get("sector") or industry_name,
+                    "concepts": item.get("concepts", []),
+                }
+            )
+        exposures: dict[str, float] = {}
+        total_asset = float(account.get("total_asset", 0) or 0)
+        for item in positions:
+            sector = item.get("sector") or "unknown"
+            exposures[sector] = exposures.get(sector, 0.0) + float(item.get("market_value") or 0)
+        return {
+            "status": "ok",
+            "fetched_at": fetched_time,
+            "cash": _nullable_float(account.get("cash")),
+            "total_asset": total_asset,
+            "positions": positions,
+            "sector_exposure": [
+                {"sector": sector, "market_value": value, "ratio": value / total_asset if total_asset else None}
+                for sector, value in exposures.items()
+            ],
+        }
+
+    def stock_intraday_analysis(self, payload: dict[str, Any]) -> dict[str, Any]:
+        code = normalize_code(payload.get("code", ""))
+        limit = int(payload.get("intraday_limit", 0) or 0) or None
+        cash = None
+        if isinstance(payload.get("account"), dict):
+            cash = _nullable_float(payload["account"].get("cash"))
+        phase = trading_phase()
+        top_fetched_at = fetched_at()
+        missing_fields: list[str] = []
+
+        try:
+            quote = self._quote_detail(code)
+        except Exception as exc:  # noqa: BLE001
+            quote = self._module_failed(exc)
+        try:
+            intraday = self._intraday_rows(code, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            intraday = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            order_book = self._order_book_5(code, cash=cash)
+        except Exception as exc:  # noqa: BLE001
+            order_book = {"status": "failed", "fetched_at": fetched_at(), "bid": [], "ask": [], "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            recent_trades = self._recent_trade_rows(code, limit=int(payload.get("trade_limit", 100) or 100))
+        except Exception as exc:  # noqa: BLE001
+            recent_trades = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            technical = self._technical_indicators(code)
+        except Exception as exc:  # noqa: BLE001
+            technical = self._module_failed(exc)
+        try:
+            board = self._board_context(code)
+        except Exception as exc:  # noqa: BLE001
+            board = {"status": "failed", "fetched_at": fetched_at(), "industry": None, "concepts": [], "core_stocks": [], "error": f"{type(exc).__name__}: {exc}"}
+        market = self._market_context(include_breadth=bool(payload.get("include_market_breadth", False)))
+        zt_related = self._zt_pool_related(code)
+        account = self._account_context(payload.get("account", {}) or {}, quote, board)
+
+        required_quote_fields = [
+            "latest_price",
+            "change",
+            "change_pct",
+            "pre_close",
+            "open",
+            "high",
+            "low",
+            "turnover_rate",
+            "volume_ratio",
+            "volume",
+            "amount",
+            "total_market_cap",
+            "circulating_market_cap",
+            "limit_up_price",
+            "limit_down_price",
+            "amplitude",
+        ]
+        for field in required_quote_fields:
+            if quote.get(field) is None:
+                missing_fields.append(f"quote.{field}")
+        data_quality = {
+            "quote_status": quote.get("status", "failed"),
+            "intraday_status": intraday.get("status", "failed"),
+            "order_book_status": order_book.get("status", "failed"),
+            "recent_trades_status": recent_trades.get("status", "failed"),
+            "board_status": board.get("status", "failed"),
+            "technical_status": technical.get("status", "failed"),
+            "market_status": market.get("status", "failed"),
+            "zt_pool_status": zt_related.get("status", "failed"),
+            "missing_fields": missing_fields,
+            "estimated_delay_seconds": 3 if phase == "continuous_auction" else None,
+        }
+        freshness = "failed" if quote.get("status") == "failed" else freshness_for_phase(phase)
+        return json_safe(
+            {
+                "code": code,
+                "name": quote.get("name"),
+                "freshness": freshness,
+                "fetched_at": top_fetched_at,
+                "data_quality": data_quality,
+                "quote": quote,
+                "intraday_1m": intraday,
+                "order_book_5": order_book,
+                "recent_trades": recent_trades,
+                "technical": technical,
+                "board": board,
+                "market": market,
+                "zt_pool_related": zt_related,
+                "account": account,
+            }
+        )
 
     def market_snapshot(self) -> dict[str, Any]:
         quote_error = None
@@ -724,16 +1485,34 @@ class MarketDataService:
             )
         up_count = int((quotes["day_change_pct"] > 0).sum()) if not quotes.empty else 0
         down_count = int((quotes["day_change_pct"] < 0).sum()) if not quotes.empty else 0
+        flat_count = int((quotes["day_change_pct"] == 0).sum()) if not quotes.empty else 0
         limit_up_count = int((quotes["day_change_pct"] >= 9.7).sum()) if not quotes.empty else 0
         limit_down_count = int((quotes["day_change_pct"] <= -9.7).sum()) if not quotes.empty else 0
+        total_market_amount = float(quotes["amount"].sum()) if not quotes.empty and "amount" in quotes.columns else None
+        shanghai_amount = (
+            float(quotes[quotes["code"].str.startswith("6")]["amount"].sum())
+            if not quotes.empty and "amount" in quotes.columns
+            else None
+        )
+        shenzhen_amount = (
+            float(quotes[quotes["code"].str.startswith(("0", "2", "3"))]["amount"].sum())
+            if not quotes.empty and "amount" in quotes.columns
+            else None
+        )
         up_ratio = up_count / max(up_count + down_count, 1)
         market_temperature = "强势" if up_ratio >= 0.62 else "震荡" if up_ratio >= 0.45 else "弱势"
         data = {
             "indices": indices.head(20).to_dict(orient="records"),
             "up_count": up_count,
             "down_count": down_count,
+            "flat_count": flat_count,
             "limit_up_count": limit_up_count,
             "limit_down_count": limit_down_count,
+            "real_limit_up_count": limit_up_count,
+            "open_board_count": None,
+            "total_market_amount": total_market_amount,
+            "shanghai_amount": shanghai_amount,
+            "shenzhen_amount": shenzhen_amount,
             "market_temperature": market_temperature,
             "breadth_available": not quotes.empty,
             "breadth_error": quote_error,
@@ -1038,6 +1817,10 @@ def create_app(service: MarketDataService | None = None):
     @app.get("/stock/technical")
     def stock_technical(code: str):
         return service.technical(code)
+
+    @app.post("/stock/intraday-analysis")
+    def stock_intraday_analysis(payload: dict[str, Any]):
+        return service.stock_intraday_analysis(payload)
 
     @app.get("/candidates/actionable")
     def candidates_actionable(cash: float, price_limit: float = 20.0, limit: int = 20):

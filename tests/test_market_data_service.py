@@ -206,6 +206,189 @@ def test_verify_candidates_scores_chatgpt_candidates_without_full_market_scan() 
     assert "涨幅过高，不适合追高" in reasons["000001"]
 
 
+def test_stock_intraday_analysis_returns_trading_decision_data_contract() -> None:
+    hist_df = pd.DataFrame(
+        {
+            "日期": [f"2026-06-{day:02d}" for day in range(1, 31)] + [f"2026-07-{day:02d}" for day in range(1, 31)],
+            "开盘": [7.0 + i * 0.02 for i in range(60)],
+            "最高": [7.2 + i * 0.02 for i in range(60)],
+            "最低": [6.8 + i * 0.02 for i in range(60)],
+            "收盘": [7.0 + i * 0.02 for i in range(60)],
+            "成交量": [100000 + i * 1000 for i in range(60)],
+        }
+    )
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {
+                    "代码": "002100",
+                    "名称": "天康生物",
+                    "最新价": 8.76,
+                    "涨跌额": 0.12,
+                    "涨跌幅": 1.39,
+                    "昨收": 8.64,
+                    "今开": 8.66,
+                    "最高": 8.82,
+                    "最低": 8.58,
+                    "换手率": 3.2,
+                    "量比": 1.4,
+                    "成交量": 12345600,
+                    "成交额": 108000000,
+                    "总市值": 12000000000,
+                    "流通市值": 9000000000,
+                    "涨停价": 9.50,
+                    "跌停价": 7.78,
+                    "振幅": 2.78,
+                }
+            ]
+        ),
+        bidasks={
+            "002100": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 8.76},
+                    {"item": "涨幅", "value": 1.39},
+                    {"item": "buy_1", "value": 8.75},
+                    {"item": "buy_1_volume", "value": 12000},
+                    {"item": "buy_2", "value": 8.74},
+                    {"item": "buy_2_volume", "value": 18000},
+                    {"item": "buy_3", "value": 8.73},
+                    {"item": "buy_3_volume", "value": 15000},
+                    {"item": "buy_4", "value": 8.72},
+                    {"item": "buy_4_volume", "value": 9000},
+                    {"item": "buy_5", "value": 8.71},
+                    {"item": "buy_5_volume", "value": 7000},
+                    {"item": "sell_1", "value": 8.76},
+                    {"item": "sell_1_volume", "value": 15000},
+                    {"item": "sell_2", "value": 8.77},
+                    {"item": "sell_2_volume", "value": 9000},
+                    {"item": "sell_3", "value": 8.78},
+                    {"item": "sell_3_volume", "value": 21000},
+                    {"item": "sell_4", "value": 8.79},
+                    {"item": "sell_4_volume", "value": 6000},
+                    {"item": "sell_5", "value": 8.80},
+                    {"item": "sell_5_volume", "value": 5000},
+                ]
+            )
+        },
+        boards_df=pd.DataFrame(
+            [
+                {
+                    "board_type": "行业",
+                    "board_name": "饲料",
+                    "change_pct": 2.1,
+                    "rank": 3,
+                    "amount": 3000000000,
+                    "turnover_rate": 4.2,
+                    "main_net_inflow": 120000000,
+                    "up_count": 18,
+                    "down_count": 5,
+                    "leader_code": "002100",
+                    "leader": "天康生物",
+                    "leader_change_pct": 6.2,
+                    "limit_up_count": 2,
+                },
+                {
+                    "board_type": "概念",
+                    "board_name": "猪肉",
+                    "change_pct": 1.8,
+                    "rank": 5,
+                    "amount": 1800000000,
+                    "main_net_inflow": 80000000,
+                    "leader_code": "002100",
+                    "leader": "天康生物",
+                    "leader_change_pct": 6.2,
+                    "limit_up_count": 1,
+                },
+            ]
+        ),
+        hist={"002100": hist_df},
+        intraday={
+            "002100": pd.DataFrame(
+                [
+                    {"time": "10:29", "price": 8.74, "avg_price": 8.70, "open": 8.72, "high": 8.75, "low": 8.70, "close": 8.74, "volume": 10000, "amount": 87400},
+                    {"time": "10:30", "price": 8.76, "avg_price": 8.71, "open": 8.74, "high": 8.78, "low": 8.73, "close": 8.76, "volume": 12000, "amount": 105120},
+                ]
+            )
+        },
+        recent_trades={
+            "002100": pd.DataFrame(
+                [
+                    {"time": "10:30:12", "price": 8.76, "volume": 60000, "amount": 525600, "side": "buy"},
+                ]
+            )
+        },
+        zt_pool=pd.DataFrame(
+            [
+                {
+                    "code": "002100",
+                    "name": "天康生物",
+                    "change_pct": 10.01,
+                    "latest_price": 9.50,
+                    "limit_up_price": 9.50,
+                    "seal_amount": 30000000,
+                    "industry": "饲料",
+                }
+            ]
+        ),
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis(
+        {
+            "code": "002100",
+            "account": {
+                "cash": 5000,
+                "total_asset": 12000,
+                "positions": [
+                    {"code": "002100", "name": "天康生物", "shares": 100, "available": 0, "cost": 8.5}
+                ],
+            },
+        }
+    )
+
+    assert out["freshness"] in {"live", "after_close", "delayed"}
+    assert out["data_quality"]["quote_status"] == "ok"
+    assert out["data_quality"]["intraday_status"] == "ok"
+    assert out["data_quality"]["order_book_status"] == "ok"
+    assert out["quote"]["code"] == "002100"
+    assert out["quote"]["market"] == "SZ"
+    assert out["intraday_1m"]["rows"][-1]["avg_price"] == 8.71
+    assert out["order_book_5"]["bid"][0] == {"price": 8.75, "volume": 12000.0}
+    assert out["recent_trades"]["rows"][0]["large_order_flag"] is True
+    assert out["technical"]["ma5"] is not None
+    assert out["technical"]["boll_upper"] is not None
+    assert out["board"]["industry"]["name"] == "饲料"
+    assert out["market"]["trading_phase"] in {"pre_open", "continuous_auction", "lunch_break", "after_close", "non_trading_day"}
+    assert out["account"]["positions"][0]["today_buy_flag"] is True
+    assert out["account"]["sector_exposure"][0]["sector"] == "饲料"
+
+
+def test_stock_intraday_analysis_does_not_invent_unmatched_board() -> None:
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "002100", "名称": "天康生物", "最新价": 8.76, "涨跌幅": 1.0}]),
+        bidasks={
+            "002100": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 8.76},
+                    {"item": "涨幅", "value": 1.0},
+                    {"item": "buy_1", "value": 8.75},
+                    {"item": "sell_1", "value": 8.76},
+                ]
+            )
+        },
+        boards_df=pd.DataFrame(
+            [
+                {"board_type": "行业", "board_name": "玻璃行业", "leader_code": "603021", "leader": "别的股票"},
+            ]
+        ),
+        hist={"002100": pd.DataFrame({"收盘": [5 + i * 0.05 for i in range(80)]})},
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis({"code": "002100"})
+
+    assert out["board"]["status"] == "partial"
+    assert out["board"]["industry"] is None
+
+
 def test_technical_endpoint_returns_trade_points() -> None:
     provider = StaticMarketDataProvider(
         hist={
@@ -353,6 +536,21 @@ def test_sina_provider_parses_daily_hist() -> None:
 
     assert list(hist["收盘"]) == [10.2, 10.6]
     assert list(hist["日期"]) == ["2026-06-29", "2026-06-30"]
+
+
+def test_sina_provider_parses_intraday_amount_as_numeric() -> None:
+    provider = SinaMarketDataProvider(
+        fetcher=lambda *, node, page, page_size: [],
+    )
+    provider._fetch_intraday = lambda *, symbol, datalen: [  # type: ignore[method-assign]
+        {"day": "2026-07-01 10:29:00", "open": "8.70", "high": "8.76", "low": "8.68", "close": "8.75", "volume": "10000", "amount": "87500.00"},
+        {"day": "2026-07-01 10:30:00", "open": "8.75", "high": "8.78", "low": "8.74", "close": "8.76", "volume": "12000", "amount": "105120.00"},
+    ]
+
+    intraday = provider.intraday_1m("002100")
+
+    assert list(intraday["amount"]) == [87500.0, 105120.0]
+    assert round(float(intraday.iloc[-1]["avg_price"]), 4) == 8.7555
 
 
 def test_fallback_provider_uses_fallback_when_boards_empty() -> None:

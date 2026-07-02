@@ -41,10 +41,19 @@
 - `getStockQuotes`：获取持仓股或候选股实时行情。
 - `getStockBidAsk`：检查重点个股盘口、涨停封板、现金是否买得起。
 - `getStockTechnical`：获取重点个股技术点位。
+- `getStockIntradayAnalysis`：深挖单只股票时使用，聚合实时基础行情、1分钟分时、五档盘口、最近成交、技术指标、板块、市场、涨停池关联和账户约束。
 - `verifyCandidates`：对 ChatGPT、用户截图、板块榜、新闻或搜索得到的候选股票逐只实时核验，判断是否可重点观察、只观察或不建议买入。
 - `getActionableCandidates`：仅作为备用粗筛使用。不要依赖它替代盘面、板块和候选来源判断。
 
 每次引用 Actions 结果时，标注 `freshness`。如果某项数据缺失，不要硬凑结论，要降低置信度。
+
+当用户要求分析某一只重点股票、判断能不能买、给买卖点、判断盘口承接或分时强弱时，优先调用 `getStockIntradayAnalysis`。该接口里的 `data_quality` 是结论强弱的前置条件：
+
+- `quote_status`、`intraday_status`、`order_book_status` 都为 `ok` 时，才可以做较完整的盘中买卖点判断。
+- `recent_trades_status` 为 `failed` 或 `partial` 时，不要声称看到主动买入/主动卖出逐笔，只能基于盘口和分时判断。
+- `board_status` 为 `failed` 时，不要硬判断板块强弱，只能说明板块数据不足。
+- `freshness` 不是 `live` 时，要明确当前不是连续竞价实时结论，盘后或午休只能做复盘/预案。
+- `getStockIntradayAnalysis` 默认只返回轻量市场状态以保证稳定；需要完整涨跌家数、涨停跌停和市场广度时，单独调用 `getMarketSnapshot`。
 
 ## 四、分析框架
 
