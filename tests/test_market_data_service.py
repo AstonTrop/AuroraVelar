@@ -377,6 +377,35 @@ def test_stock_intraday_analysis_returns_trading_decision_data_contract() -> Non
     assert out["technical_interpretation"]["turnaround_condition"]
     assert "分时均价" in out["technical_interpretation"]["point_sources"]
     assert out["technical_interpretation"]["risk_tags"]
+    assert out["recent_3d_context"]["days_count"] == 3
+    assert out["recent_3d_context"]["three_day_high"] is not None
+    assert out["recent_3d_context"]["three_day_low"] is not None
+    assert out["recent_3d_context"]["volume_trend_3d"] in {"放大", "萎缩", "平稳", "混乱", "不可确认"}
+    assert out["today_intraday_summary"]["vwap_deviation_pct"] is not None
+    assert out["today_intraday_summary"]["close_location_pct"] is not None
+    assert out["today_intraday_summary"]["phase_pattern"]
+    assert out["candlestick_structure"]["body_pct"] is not None
+    assert out["candlestick_structure"]["pattern_tags"]
+    assert out["moving_average_structure"]["structure"] in {"多头排列", "空头排列", "均线纠缠", "均线不足"}
+    assert out["moving_average_structure"]["distance_to_ma20_pct"] is not None
+    assert out["volume_price_relation"]["relation"]
+    assert out["relative_strength"]["vs_market"] in {"强于市场", "弱于市场", "同步市场", "不可确认"}
+    assert out["support_resistance_zones"]["support_zones"]
+    assert out["support_resistance_zones"]["resistance_zones"]
+    assert out["risk_volatility"]["intraday_amplitude_pct"] is not None
+    assert out["order_book_interpretation"]["bid_ask_ratio"] is not None
+    assert out["board_stock_alignment"]["status"] in {"ok", "partial", "failed"}
+    assert out["board_stock_alignment"]["stock_vs_board"] in {"强于板块", "弱于板块", "同步板块", "不可确认"}
+    assert out["board_stock_alignment"]["conclusion_adjustment"] in {"上调", "不变", "下调", "降级"}
+    assert out["position_risk_contribution"]["shares"] == 100
+    assert out["position_risk_contribution"]["available"] == 0
+    assert out["technical_level_layers"]["intraday_strength_line"]["source"]
+    assert out["technical_level_layers"]["turn_strong_line"]["source"]
+    assert out["next_session_scenarios"]["low_open_weak_rebound"]["action"]
+    assert out["next_session_scenarios"]["flat_open_chop"]["action"]
+    assert out["next_session_scenarios"]["high_open_repair"]["action"]
+    assert out["review_log_receipt"]["status"] == "not_logged_by_analysis_endpoint"
+    assert out["review_log_receipt"]["require_review_id_when_claiming_logged"] is True
     completeness = out["response_completeness_check"]
     assert completeness["required_sections"] == [
         "数据来源与质量",

@@ -74,6 +74,18 @@ def _safe_float(value: object, default: float = float("nan")) -> float:
     return float(value)
 
 
+def _pct_change(new: float | None, old: float | None) -> float | None:
+    if new is None or old in (None, 0):
+        return None
+    return round((new - old) / old * 100, 4)
+
+
+def _ratio(part: float | None, whole: float | None) -> float | None:
+    if part is None or whole in (None, 0):
+        return None
+    return round(part / whole, 4)
+
+
 def _quote_col(df: pd.DataFrame, *names: str) -> str | None:
     for name in names:
         if name in df.columns:
@@ -1281,6 +1293,27 @@ class MarketDataService:
             return {"status": "failed", "fetched_at": fetched_time, "error": "No daily history returned"}
         return {"status": "ok", "fetched_at": fetched_time, **calculate_intraday_technical_indicators(hist_df)}
 
+    def _history_rows(self, code: str) -> dict[str, Any]:
+        fetched_time = fetched_at()
+        hist_df = self.provider.hist(code)
+        if hist_df is None or hist_df.empty:
+            return {"status": "failed", "fetched_at": fetched_time, "rows": [], "error": "No daily history returned"}
+        rows = []
+        for _, row in hist_df.tail(120).iterrows():
+            row_dict = row.to_dict()
+            rows.append(
+                {
+                    "date": str(_pick(row_dict, "日期", "date", default="")),
+                    "open": _nullable_float(_pick(row_dict, "开盘", "open")),
+                    "high": _nullable_float(_pick(row_dict, "最高", "high")),
+                    "low": _nullable_float(_pick(row_dict, "最低", "low")),
+                    "close": _nullable_float(_pick(row_dict, "收盘", "close", "最新价")),
+                    "volume": _nullable_float(_pick(row_dict, "成交量", "volume")),
+                    "amount": _nullable_float(_pick(row_dict, "成交额", "amount")),
+                }
+            )
+        return {"status": "ok", "fetched_at": fetched_time, "rows": rows}
+
     def _board_context(self, code: str) -> dict[str, Any]:
         fetched_time = fetched_at()
         board_df = self.provider.boards()
@@ -2108,6 +2141,586 @@ class MarketDataService:
             },
         }
 
+    def _recent_3d_context(self, history: dict[str, Any]) -> dict[str, Any]:
+        rows = history.get("rows") if isinstance(history.get("rows"), list) else []
+        recent_rows = rows[-3:] if rows else []
+        previous_rows = rows[-4:] if len(rows) >= 4 else recent_rows
+        enriched = []
+        for index, row in enumerate(recent_rows):
+            previous = previous_rows[index] if len(previous_rows) == len(recent_rows) + 1 else None
+            previous_close = _nullable_float(previous.get("close")) if isinstance(previous, dict) else None
+            open_price = _nullable_float(row.get("open"))
+            high = _nullable_float(row.get("high"))
+            low = _nullable_float(row.get("low"))
+            close = _nullable_float(row.get("close"))
+            volume = _nullable_float(row.get("volume"))
+            base = previous_close if previous_close not in (None, 0) else open_price
+            close_location = None
+            if high is not None and low is not None and high != low and close is not None:
+                close_location = round((close - low) / (high - low) * 100, 2)
+            enriched.append(
+                {
+                    "date": row.get("date"),
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "amount": _nullable_float(row.get("amount")),
+                    "change_pct": _pct_change(close, base),
+                    "close_location_pct": close_location,
+                }
+            )
+
+        closes = [_nullable_float(item.get("close")) for item in enriched]
+        highs = [_nullable_float(item.get("high")) for item in enriched]
+        lows = [_nullable_float(item.get("low")) for item in enriched]
+        volumes = [_nullable_float(item.get("volume")) for item in enriched]
+        valid_closes = [value for value in closes if value is not None]
+        valid_highs = [value for value in highs if value is not None]
+        valid_lows = [value for value in lows if value is not None]
+        valid_volumes = [value for value in volumes if value is not None]
+
+        if len(valid_volumes) < 3:
+            volume_trend = "不可确认"
+        elif valid_volumes[0] < valid_volumes[1] < valid_volumes[2]:
+            volume_trend = "放大"
+        elif valid_volumes[0] > valid_volumes[1] > valid_volumes[2]:
+            volume_trend = "萎缩"
+        elif max(valid_volumes) and (max(valid_volumes) - min(valid_volumes)) / max(valid_volumes) <= 0.15:
+            volume_trend = "平稳"
+        else:
+            volume_trend = "混乱"
+
+        if len(valid_closes) >= 3 and valid_closes[0] < valid_closes[1] < valid_closes[2]:
+            direction = "连续上涨"
+        elif len(valid_closes) >= 3 and valid_closes[0] > valid_closes[1] > valid_closes[2]:
+            direction = "连续下跌"
+        elif len(valid_closes) >= 2:
+            direction = "震荡"
+        else:
+            direction = "不可确认"
+
+        pattern_tags = []
+        if len(enriched) >= 2:
+            last = enriched[-1]
+            prev = enriched[-2]
+            last_close = _nullable_float(last.get("close"))
+            prev_close = _nullable_float(prev.get("close"))
+            last_volume = _nullable_float(last.get("volume"))
+            prev_volume = _nullable_float(prev.get("volume"))
+            if last_close is not None and prev_close is not None and last_volume is not None and prev_volume is not None:
+                if last_close > prev_close and last_volume > prev_volume:
+                    pattern_tags.append("放量上涨")
+                elif last_close < prev_close and last_volume > prev_volume:
+                    pattern_tags.append("放量下跌")
+                elif last_close > prev_close and last_volume <= prev_volume:
+                    pattern_tags.append("缩量反弹")
+                elif last_close < prev_close and last_volume <= prev_volume:
+                    pattern_tags.append("缩量回踩")
+        if not pattern_tags:
+            pattern_tags.append("三日结构需结合分时确认")
+
+        three_day_high = max(valid_highs) if valid_highs else None
+        three_day_low = min(valid_lows) if valid_lows else None
+        three_day_amplitude = None
+        if three_day_high is not None and three_day_low not in (None, 0):
+            three_day_amplitude = round((three_day_high - three_day_low) / three_day_low * 100, 2)
+
+        return {
+            "status": history.get("status", "failed"),
+            "fetched_at": history.get("fetched_at"),
+            "days_count": len(enriched),
+            "days": enriched,
+            "three_day_return_pct": _pct_change(valid_closes[-1], valid_closes[0]) if len(valid_closes) >= 2 else None,
+            "three_day_high": three_day_high,
+            "three_day_low": three_day_low,
+            "three_day_amplitude_pct": three_day_amplitude,
+            "volume_trend_3d": volume_trend,
+            "direction_3d": direction,
+            "pattern_tags": pattern_tags,
+            "usage_note": "用于避免只看当日收盘；必须结合最近三日高低点、量能和当日分时判断。",
+        }
+
+    def _today_intraday_summary(self, quote: dict[str, Any], intraday: dict[str, Any]) -> dict[str, Any]:
+        rows = intraday.get("rows") if isinstance(intraday.get("rows"), list) else []
+        if not rows:
+            return {
+                "status": intraday.get("status", "failed"),
+                "fetched_at": intraday.get("fetched_at"),
+                "vwap_deviation_pct": None,
+                "close_location_pct": None,
+                "high_to_close_drawdown_pct": None,
+                "phase_pattern": "分时不可确认",
+                "last_5m_direction": "不可确认",
+                "last_15m_direction": "不可确认",
+                "last_30m_direction": "不可确认",
+            }
+
+        def row_price(item: dict[str, Any]) -> float | None:
+            return _nullable_float(item.get("close") or item.get("price"))
+
+        first_price = row_price(rows[0])
+        last_price = row_price(rows[-1]) or _nullable_float(quote.get("latest_price"))
+        avg_price = _nullable_float(rows[-1].get("avg_price") or rows[-1].get("vwap"))
+        highs = [_nullable_float(item.get("high")) for item in rows]
+        lows = [_nullable_float(item.get("low")) for item in rows]
+        valid_highs = [value for value in highs if value is not None]
+        valid_lows = [value for value in lows if value is not None]
+        day_high = max(valid_highs) if valid_highs else _nullable_float(quote.get("high"))
+        day_low = min(valid_lows) if valid_lows else _nullable_float(quote.get("low"))
+
+        close_location = None
+        if day_high is not None and day_low is not None and day_high != day_low and last_price is not None:
+            close_location = round((last_price - day_low) / (day_high - day_low) * 100, 2)
+        drawdown = None
+        if day_high not in (None, 0) and last_price is not None:
+            drawdown = round((day_high - last_price) / day_high * 100, 2)
+
+        def direction(window: int) -> str:
+            segment = rows[-window:] if len(rows) >= window else rows
+            if len(segment) < 2:
+                return "不可确认"
+            start = row_price(segment[0])
+            end = row_price(segment[-1])
+            if start is None or end is None:
+                return "不可确认"
+            if end > start:
+                return "上行"
+            if end < start:
+                return "下行"
+            return "横盘"
+
+        if last_price is not None and avg_price is not None:
+            if last_price >= avg_price and close_location is not None and close_location >= 60:
+                phase_pattern = "收盘站上均价且位置偏高"
+            elif last_price >= avg_price:
+                phase_pattern = "收盘站上均价但位置一般"
+            elif close_location is not None and close_location <= 35:
+                phase_pattern = "收盘低于均价且接近日内低位"
+            else:
+                phase_pattern = "收盘低于均价"
+        else:
+            phase_pattern = "分时均价不足"
+
+        return {
+            "status": intraday.get("status", "failed"),
+            "fetched_at": intraday.get("fetched_at"),
+            "first_price": first_price,
+            "last_price": last_price,
+            "avg_price": avg_price,
+            "day_high_from_intraday": day_high,
+            "day_low_from_intraday": day_low,
+            "vwap_deviation_pct": _pct_change(last_price, avg_price),
+            "close_location_pct": close_location,
+            "high_to_close_drawdown_pct": drawdown,
+            "total_volume": sum(_nullable_float(item.get("volume")) or 0 for item in rows),
+            "last_5m_direction": direction(5),
+            "last_15m_direction": direction(15),
+            "last_30m_direction": direction(30),
+            "phase_pattern": phase_pattern,
+            "usage_note": "用于判断站上均价、冲高回落、尾盘偷拉或弱磨，不允许只看最新价。",
+        }
+
+    def _candlestick_structure(self, quote: dict[str, Any]) -> dict[str, Any]:
+        open_price = _nullable_float(quote.get("open"))
+        close = _nullable_float(quote.get("latest_price"))
+        high = _nullable_float(quote.get("high"))
+        low = _nullable_float(quote.get("low"))
+        body_pct = (
+            round(abs(close - open_price) / open_price * 100, 2)
+            if close is not None and open_price not in (None, 0)
+            else None
+        )
+        upper_shadow_pct = None
+        lower_shadow_pct = None
+        if None not in (open_price, close, high, low) and open_price:
+            upper_shadow_pct = round((high - max(open_price, close)) / open_price * 100, 2)
+            lower_shadow_pct = round((min(open_price, close) - low) / open_price * 100, 2)
+        tags = []
+        if open_price is not None and close is not None:
+            tags.append("阳线" if close >= open_price else "阴线")
+        if body_pct is not None and body_pct <= 0.3:
+            tags.append("小实体/十字倾向")
+        if upper_shadow_pct is not None and upper_shadow_pct >= 1.0:
+            tags.append("上影线压力")
+        if lower_shadow_pct is not None and lower_shadow_pct >= 1.0:
+            tags.append("下影线承接")
+        if not tags:
+            tags.append("K线结构不可确认")
+        return {
+            "status": quote.get("status", "failed"),
+            "fetched_at": quote.get("fetched_at"),
+            "open": open_price,
+            "close": close,
+            "high": high,
+            "low": low,
+            "body_pct": body_pct,
+            "upper_shadow_pct": upper_shadow_pct,
+            "lower_shadow_pct": lower_shadow_pct,
+            "pattern_tags": tags,
+            "usage_note": "用于解释冲高回落、下影承接和实体强弱。",
+        }
+
+    def _moving_average_structure(self, quote: dict[str, Any], technical: dict[str, Any]) -> dict[str, Any]:
+        latest = _nullable_float(quote.get("latest_price"))
+        ma5 = _nullable_float(technical.get("ma5"))
+        ma10 = _nullable_float(technical.get("ma10"))
+        ma20 = _nullable_float(technical.get("ma20"))
+        ma60 = _nullable_float(technical.get("ma60"))
+        ma_values = [ma5, ma10, ma20, ma60]
+        if sum(value is not None for value in ma_values) < 3:
+            structure = "均线不足"
+        elif ma5 is not None and ma10 is not None and ma20 is not None and ma60 is not None and ma5 > ma10 > ma20 > ma60:
+            structure = "多头排列"
+        elif ma5 is not None and ma10 is not None and ma20 is not None and ma60 is not None and ma5 < ma10 < ma20 < ma60:
+            structure = "空头排列"
+        else:
+            structure = "均线纠缠"
+        return {
+            "status": technical.get("status", "failed"),
+            "fetched_at": technical.get("fetched_at"),
+            "ma5": ma5,
+            "ma10": ma10,
+            "ma20": ma20,
+            "ma60": ma60,
+            "structure": structure,
+            "distance_to_ma5_pct": _pct_change(latest, ma5),
+            "distance_to_ma20_pct": _pct_change(latest, ma20),
+            "distance_to_ma60_pct": _pct_change(latest, ma60),
+            "usage_note": "用于判断日线趋势是进攻、修复还是反弹压力。",
+        }
+
+    def _volume_price_relation(self, quote: dict[str, Any], recent_3d_context: dict[str, Any]) -> dict[str, Any]:
+        days = recent_3d_context.get("days") if isinstance(recent_3d_context.get("days"), list) else []
+        relation = "量价不可确认"
+        explanation = "三日成交量或收盘价不足，不能判断量价关系。"
+        if len(days) >= 2:
+            last = days[-1]
+            prev = days[-2]
+            last_close = _nullable_float(last.get("close"))
+            prev_close = _nullable_float(prev.get("close"))
+            last_volume = _nullable_float(last.get("volume"))
+            prev_volume = _nullable_float(prev.get("volume"))
+            if None not in (last_close, prev_close, last_volume, prev_volume):
+                price_up = last_close >= prev_close
+                volume_up = last_volume >= prev_volume
+                if price_up and volume_up:
+                    relation = "放量上涨"
+                    explanation = "价格较前一日上行且成交量放大，说明有增量资金参与。"
+                elif (not price_up) and volume_up:
+                    relation = "放量下跌"
+                    explanation = "价格回落但成交量放大，需要警惕资金分歧或抛压释放。"
+                elif price_up and not volume_up:
+                    relation = "缩量反弹"
+                    explanation = "价格反弹但量能未同步，持续性需要分时和板块确认。"
+                else:
+                    relation = "缩量回踩"
+                    explanation = "价格回落且量能收缩，需看是否守住关键支撑。"
+        return {
+            "status": recent_3d_context.get("status", "failed"),
+            "fetched_at": recent_3d_context.get("fetched_at"),
+            "relation": relation,
+            "volume_ratio": quote.get("volume_ratio"),
+            "turnover_rate": quote.get("turnover_rate"),
+            "explanation": explanation,
+            "usage_note": "用于约束GPT必须说明上涨/下跌是否有量能支持。",
+        }
+
+    def _relative_strength(self, quote: dict[str, Any], board: dict[str, Any], market: dict[str, Any]) -> dict[str, Any]:
+        stock_change = _nullable_float(quote.get("change_pct"))
+        index_values = []
+        if isinstance(market.get("index"), dict):
+            index_values = [
+                _nullable_float(market["index"].get(key))
+                for key in ["shanghai_change_pct", "shenzhen_change_pct", "chinext_change_pct"]
+            ]
+        market_values = [value for value in index_values if value is not None]
+        market_change = round(sum(market_values) / len(market_values), 4) if market_values else None
+        industry = board.get("industry") if isinstance(board.get("industry"), dict) else {}
+        board_change = _nullable_float(industry.get("change_pct")) if industry else None
+
+        def compare(base: float | None, target: float | None, strong_label: str, weak_label: str, sync_label: str) -> str:
+            if base is None or target is None:
+                return "不可确认"
+            spread = base - target
+            if spread >= 0.5:
+                return strong_label
+            if spread <= -0.5:
+                return weak_label
+            return sync_label
+
+        return {
+            "status": "ok" if stock_change is not None and (market_change is not None or board_change is not None) else "partial",
+            "fetched_at": quote.get("fetched_at"),
+            "stock_change_pct": stock_change,
+            "market_change_pct": market_change,
+            "board_change_pct": board_change,
+            "vs_market": compare(stock_change, market_change, "强于市场", "弱于市场", "同步市场"),
+            "vs_board": compare(stock_change, board_change, "强于板块", "弱于板块", "同步板块"),
+            "usage_note": "用于判断个股是主动强、跟随强，还是板块强但个股掉队。",
+        }
+
+    def _support_resistance_zones(
+        self,
+        *,
+        quote: dict[str, Any],
+        intraday_summary: dict[str, Any],
+        technical: dict[str, Any],
+        recent_3d_context: dict[str, Any],
+        account: dict[str, Any],
+    ) -> dict[str, Any]:
+        positions = account.get("positions") if isinstance(account.get("positions"), list) else []
+        matched = next((item for item in positions if normalize_code(item.get("code", "")) == normalize_code(quote.get("code", ""))), {})
+        supports = []
+        resistances = []
+
+        def add_zone(target: list[dict[str, Any]], name: str, price: float | None, source: str) -> None:
+            if price is None or price <= 0:
+                return
+            target.append({"name": name, "price": round(price, 4), "source": source})
+
+        add_zone(supports, "分时均价", _nullable_float(intraday_summary.get("avg_price")), "intraday_1m.avg_price")
+        add_zone(supports, "当日低点", _nullable_float(quote.get("low")), "quote.low")
+        add_zone(supports, "三日低点", _nullable_float(recent_3d_context.get("three_day_low")), "recent_3d_context.three_day_low")
+        add_zone(supports, "MA20", _nullable_float(technical.get("ma20")), "technical.ma20")
+        add_zone(supports, "成本线", _nullable_float(matched.get("cost")) if isinstance(matched, dict) else None, "account.positions.cost")
+
+        add_zone(resistances, "当日高点", _nullable_float(quote.get("high")), "quote.high")
+        add_zone(resistances, "三日高点", _nullable_float(recent_3d_context.get("three_day_high")), "recent_3d_context.three_day_high")
+        add_zone(resistances, "20日高点", _nullable_float(technical.get("recent_high_20")), "technical.recent_high_20")
+        add_zone(resistances, "MA60", _nullable_float(technical.get("ma60")), "technical.ma60")
+        add_zone(resistances, "BOLL上轨", _nullable_float(technical.get("boll_upper")), "technical.boll_upper")
+
+        return {
+            "status": "ok" if supports and resistances else "partial",
+            "fetched_at": quote.get("fetched_at"),
+            "support_zones": supports,
+            "resistance_zones": resistances,
+            "usage_note": "每个买点、卖点、失败线都必须引用这里的来源字段，不能凭感觉写点位。",
+        }
+
+    def _risk_volatility(
+        self,
+        *,
+        quote: dict[str, Any],
+        technical: dict[str, Any],
+        recent_3d_context: dict[str, Any],
+        intraday_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        amplitude = _nullable_float(quote.get("amplitude"))
+        if amplitude is None:
+            high = _nullable_float(quote.get("high"))
+            low = _nullable_float(quote.get("low"))
+            pre_close = _nullable_float(quote.get("pre_close"))
+            if high is not None and low is not None and pre_close not in (None, 0):
+                amplitude = round((high - low) / pre_close * 100, 2)
+        three_day_amp = _nullable_float(recent_3d_context.get("three_day_amplitude_pct"))
+        drawdown = _nullable_float(intraday_summary.get("high_to_close_drawdown_pct"))
+        risk_level = "中"
+        if amplitude is not None and amplitude >= 7 or three_day_amp is not None and three_day_amp >= 12:
+            risk_level = "高"
+        elif amplitude is not None and amplitude <= 3 and (drawdown is None or drawdown <= 1.5):
+            risk_level = "低"
+        return {
+            "status": "ok" if amplitude is not None else "partial",
+            "fetched_at": quote.get("fetched_at"),
+            "intraday_amplitude_pct": amplitude,
+            "three_day_amplitude_pct": three_day_amp,
+            "high_to_close_drawdown_pct": drawdown,
+            "atr": technical.get("atr"),
+            "risk_level": risk_level,
+            "usage_note": "用于判断隔夜风险、追高风险和止损线宽度。",
+        }
+
+    def _order_book_interpretation(self, order_book: dict[str, Any]) -> dict[str, Any]:
+        bid_total = sum(_nullable_float(item.get("volume")) or 0 for item in order_book.get("bid", []) if isinstance(item, dict))
+        ask_total = sum(_nullable_float(item.get("volume")) or 0 for item in order_book.get("ask", []) if isinstance(item, dict))
+        bid_ask_ratio = _ratio(bid_total, ask_total)
+        if bid_ask_ratio is None:
+            pressure = "不可确认"
+        elif bid_ask_ratio >= 1.5:
+            pressure = "买盘较强"
+        elif bid_ask_ratio <= 0.67:
+            pressure = "卖压偏重"
+        else:
+            pressure = "买卖均衡"
+        return {
+            "status": order_book.get("status", "failed"),
+            "fetched_at": order_book.get("fetched_at"),
+            "bid_total": bid_total or None,
+            "ask_total": ask_total or None,
+            "bid_ask_ratio": bid_ask_ratio,
+            "pressure": pressure,
+            "spread": order_book.get("spread"),
+            "actionability": order_book.get("actionability"),
+            "top_bid": order_book.get("bid", [{}])[0] if order_book.get("bid") else None,
+            "top_ask": order_book.get("ask", [{}])[0] if order_book.get("ask") else None,
+            "usage_note": "静态五档只能辅助判断承接；若价格低于均价，买盘厚也不能直接等同强势。",
+        }
+
+    def _board_stock_alignment(self, quote: dict[str, Any], board: dict[str, Any]) -> dict[str, Any]:
+        stock_change = _nullable_float(quote.get("change_pct"))
+        industry = board.get("industry") if isinstance(board.get("industry"), dict) else {}
+        industry_change = _nullable_float(industry.get("change_pct")) if industry else None
+        status = board.get("status", "failed")
+        if status not in {"ok", "partial"} or stock_change is None or industry_change is None:
+            stock_vs_board = "不可确认"
+            adjustment = "降级"
+        else:
+            spread = stock_change - industry_change
+            if spread >= 0.5:
+                stock_vs_board = "强于板块"
+                adjustment = "上调" if _nullable_int(industry.get("rank")) is not None and int(industry.get("rank")) <= 10 else "不变"
+            elif spread <= -0.5:
+                stock_vs_board = "弱于板块"
+                adjustment = "下调"
+            else:
+                stock_vs_board = "同步板块"
+                adjustment = "不变"
+        leader_code = normalize_code(industry.get("leader_code", "")) if industry else ""
+        role = "leader" if leader_code and leader_code == normalize_code(quote.get("code", "")) else "unknown"
+        if role == "unknown" and stock_vs_board == "强于板块":
+            role = "trend_core"
+        elif role == "unknown" and stock_vs_board == "弱于板块":
+            role = "laggard"
+        elif role == "unknown" and stock_vs_board == "同步板块":
+            role = "follower"
+        return {
+            "status": status,
+            "fetched_at": board.get("fetched_at"),
+            "industry": industry.get("name") if industry else None,
+            "industry_change_pct": industry_change,
+            "industry_rank": industry.get("rank") if industry else None,
+            "concepts": [item.get("name") for item in board.get("concepts", []) if isinstance(item, dict)],
+            "stock_change_pct": stock_change,
+            "stock_vs_board": stock_vs_board,
+            "stock_role_estimate": role,
+            "conclusion_adjustment": adjustment,
+            "usage_note": "必须先判断板块，再判断个股；板块数据partial/failed时，买入结论自动降级。",
+        }
+
+    def _position_risk_contribution(self, quote: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
+        positions = account.get("positions") if isinstance(account.get("positions"), list) else []
+        matched = next((item for item in positions if normalize_code(item.get("code", "")) == normalize_code(quote.get("code", ""))), {})
+        latest = _nullable_float(quote.get("latest_price"))
+        shares = int(matched.get("shares") or 0) if isinstance(matched, dict) else 0
+        available = int(matched.get("available") or 0) if isinstance(matched, dict) else 0
+        cost = _nullable_float(matched.get("cost")) if isinstance(matched, dict) else None
+        market_value = latest * shares if latest is not None else _nullable_float(matched.get("market_value")) if isinstance(matched, dict) else None
+        total_asset = _nullable_float(account.get("total_asset"))
+        pnl = (latest - cost) * shares if latest is not None and cost is not None else None
+        pnl_pct = _pct_change(latest, cost)
+        role = "非持仓观察"
+        if shares > 0 and pnl is not None:
+            role = "利润垫" if pnl > 0 else "风险源" if pnl < 0 else "持平观察"
+        return {
+            "status": "ok" if matched else "partial",
+            "fetched_at": account.get("fetched_at"),
+            "shares": shares,
+            "available": available,
+            "cost": cost,
+            "latest_price": latest,
+            "market_value": market_value,
+            "portfolio_ratio_pct": round(market_value / total_asset * 100, 2) if market_value is not None and total_asset not in (None, 0) else None,
+            "profit_loss": pnl,
+            "profit_loss_pct": pnl_pct,
+            "t_plus_1_locked": shares > available,
+            "risk_role": role,
+            "usage_note": "用于决定今天能否卖、卖多少，以及该票是利润垫还是风险源。",
+        }
+
+    def _technical_level_layers(
+        self,
+        *,
+        quote: dict[str, Any],
+        intraday_summary: dict[str, Any],
+        support_resistance_zones: dict[str, Any],
+        position_risk_contribution: dict[str, Any],
+    ) -> dict[str, Any]:
+        supports = support_resistance_zones.get("support_zones") or []
+        resistances = support_resistance_zones.get("resistance_zones") or []
+        avg_price = _nullable_float(intraday_summary.get("avg_price"))
+        latest = _nullable_float(quote.get("latest_price"))
+        low = _nullable_float(quote.get("low"))
+        high = _nullable_float(quote.get("high"))
+        cost = _nullable_float(position_risk_contribution.get("cost"))
+
+        def first_price(items: list[dict[str, Any]]) -> tuple[float | None, str]:
+            for item in items:
+                price = _nullable_float(item.get("price"))
+                if price is not None:
+                    return price, str(item.get("source") or item.get("name") or "")
+            return None, ""
+
+        fallback_support, fallback_support_source = first_price(supports)
+        fallback_resistance, fallback_resistance_source = first_price(resistances)
+        intraday_strength = avg_price if avg_price is not None else latest
+        turn_strong = high if high is not None else fallback_resistance
+        hard_stop = low if low is not None else fallback_support
+        return {
+            "intraday_strength_line": {
+                "price": intraday_strength,
+                "source": "intraday_1m.avg_price" if avg_price is not None else "quote.latest_price",
+                "usage": "站上/跌破后判断日内强弱，不等同最终买卖点。",
+            },
+            "cost_repair_line": {
+                "price": cost,
+                "source": "account.positions.cost",
+                "usage": "持仓票是否修复到你的成本线。",
+            },
+            "hard_stop_line": {
+                "price": hard_stop,
+                "source": "quote.low" if low is not None else fallback_support_source,
+                "usage": "跌破且5-10分钟收不回，说明短线结构失败。",
+            },
+            "turn_strong_line": {
+                "price": turn_strong,
+                "source": "quote.high" if high is not None else fallback_resistance_source,
+                "usage": "放量站上后，弱修复才可能升级为强修复。",
+            },
+            "take_profit_reference": {
+                "price": fallback_resistance,
+                "source": fallback_resistance_source,
+                "usage": "接近压力区放量滞涨时考虑兑现或降仓。",
+            },
+        }
+
+    def _next_session_scenarios(
+        self,
+        *,
+        technical_level_layers: dict[str, Any],
+        position_risk_contribution: dict[str, Any],
+    ) -> dict[str, Any]:
+        available = int(position_risk_contribution.get("available") or 0)
+        strength_line = technical_level_layers.get("intraday_strength_line", {}).get("price")
+        hard_stop = technical_level_layers.get("hard_stop_line", {}).get("price")
+        turn_strong = technical_level_layers.get("turn_strong_line", {}).get("price")
+        sell_note = f"可卖{available}股" if available > 0 else "可卖0股，只能制定明日/后续预案"
+        return {
+            "low_open_weak_rebound": {
+                "condition": f"低开后反抽不过强弱线{strength_line}",
+                "action": f"{sell_note}；若跌破硬处理线{hard_stop}且5-10分钟收不回，优先降风险。",
+            },
+            "flat_open_chop": {
+                "condition": f"平开后围绕强弱线{strength_line}震荡",
+                "action": "先观察量能和板块强弱，不在均价下方追买；若板块同步走弱，降低持有评级。",
+            },
+            "high_open_repair": {
+                "condition": f"高开并放量接近或突破转强线{turn_strong}",
+                "action": "若板块同步强且盘口卖压下降，可继续持有；若冲高回落，则按压力区兑现/减仓。",
+            },
+            "usage_note": "回复里必须区分低开、平开、高开三种明日路径，避免只给单一结论。",
+        }
+
+    def _review_log_receipt(self) -> dict[str, Any]:
+        return {
+            "status": "not_logged_by_analysis_endpoint",
+            "review_id": None,
+            "require_review_id_when_claiming_logged": True,
+            "instruction": "stock_intraday_analysis只生成可保存的review_record；若GPT声称已保存，必须额外调用logReview并展示review_id。",
+        }
+
     def _review_record(
         self,
         *,
@@ -2182,6 +2795,10 @@ class MarketDataService:
         except Exception as exc:  # noqa: BLE001
             technical = self._module_failed(exc)
         try:
+            history = self._history_rows(code)
+        except Exception as exc:  # noqa: BLE001
+            history = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
+        try:
             board = self._board_context(code)
         except Exception as exc:  # noqa: BLE001
             board = {"status": "failed", "fetched_at": fetched_at(), "industry": None, "concepts": [], "core_stocks": [], "error": f"{type(exc).__name__}: {exc}"}
@@ -2217,6 +2834,7 @@ class MarketDataService:
             "recent_trades_status": recent_trades.get("status", "failed"),
             "board_status": board.get("status", "failed"),
             "technical_status": technical.get("status", "failed"),
+            "history_status": history.get("status", "failed"),
             "market_status": market.get("status", "failed"),
             "zt_pool_status": zt_related.get("status", "failed"),
             "missing_fields": missing_fields,
@@ -2268,6 +2886,39 @@ class MarketDataService:
             data_quality=data_quality,
             trading_plan=trading_plan,
         )
+        recent_3d_context = self._recent_3d_context(history)
+        today_intraday_summary = self._today_intraday_summary(quote, intraday)
+        candlestick_structure = self._candlestick_structure(quote)
+        moving_average_structure = self._moving_average_structure(quote, technical)
+        volume_price_relation = self._volume_price_relation(quote, recent_3d_context)
+        relative_strength = self._relative_strength(quote, board, market)
+        support_resistance_zones = self._support_resistance_zones(
+            quote=quote,
+            intraday_summary=today_intraday_summary,
+            technical=technical,
+            recent_3d_context=recent_3d_context,
+            account=account,
+        )
+        risk_volatility = self._risk_volatility(
+            quote=quote,
+            technical=technical,
+            recent_3d_context=recent_3d_context,
+            intraday_summary=today_intraday_summary,
+        )
+        order_book_interpretation = self._order_book_interpretation(order_book)
+        board_stock_alignment = self._board_stock_alignment(quote, board)
+        position_risk_contribution = self._position_risk_contribution(quote, account)
+        technical_level_layers = self._technical_level_layers(
+            quote=quote,
+            intraday_summary=today_intraday_summary,
+            support_resistance_zones=support_resistance_zones,
+            position_risk_contribution=position_risk_contribution,
+        )
+        next_session_scenarios = self._next_session_scenarios(
+            technical_level_layers=technical_level_layers,
+            position_risk_contribution=position_risk_contribution,
+        )
+        review_log_receipt = self._review_log_receipt()
         review_record = self._review_record(
             code=code,
             quote=quote,
@@ -2289,6 +2940,7 @@ class MarketDataService:
                 "order_book_5": order_book,
                 "recent_trades": recent_trades,
                 "technical": technical,
+                "daily_history": history,
                 "board": board,
                 "market": market,
                 "zt_pool_related": zt_related,
@@ -2296,6 +2948,20 @@ class MarketDataService:
                 "decision_score": decision_score,
                 "trading_plan": trading_plan,
                 "technical_interpretation": technical_interpretation,
+                "recent_3d_context": recent_3d_context,
+                "today_intraday_summary": today_intraday_summary,
+                "candlestick_structure": candlestick_structure,
+                "moving_average_structure": moving_average_structure,
+                "volume_price_relation": volume_price_relation,
+                "relative_strength": relative_strength,
+                "support_resistance_zones": support_resistance_zones,
+                "risk_volatility": risk_volatility,
+                "order_book_interpretation": order_book_interpretation,
+                "board_stock_alignment": board_stock_alignment,
+                "position_risk_contribution": position_risk_contribution,
+                "technical_level_layers": technical_level_layers,
+                "next_session_scenarios": next_session_scenarios,
+                "review_log_receipt": review_log_receipt,
                 "response_completeness_check": response_completeness_check,
                 "execution_checklist": execution_checklist,
                 "review_record": review_record,
