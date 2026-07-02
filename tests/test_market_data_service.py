@@ -366,6 +366,32 @@ def test_stock_intraday_analysis_returns_trading_decision_data_contract() -> Non
     assert out["trading_plan"]["style_note"] == "偏进攻、弱保守；允许进攻仓位在65%以上，但必须有失败线"
     assert out["trading_plan"]["buy_condition"]
     assert out["trading_plan"]["failure_line"]
+    assert out["technical_interpretation"]["trend_state"]
+    assert out["technical_interpretation"]["intraday_state"] == "分时偏强"
+    assert out["technical_interpretation"]["volume_state"]
+    assert out["technical_interpretation"]["support_levels"]
+    assert out["technical_interpretation"]["resistance_levels"]
+    assert out["technical_interpretation"]["buy_trigger"]
+    assert out["technical_interpretation"]["sell_trigger"]
+    assert out["technical_interpretation"]["failure_line"]
+    assert out["technical_interpretation"]["turnaround_condition"]
+    assert "分时均价" in out["technical_interpretation"]["point_sources"]
+    assert out["technical_interpretation"]["risk_tags"]
+    completeness = out["response_completeness_check"]
+    assert completeness["required_sections"] == [
+        "数据来源与质量",
+        "市场状态",
+        "板块状态",
+        "个股技术结构",
+        "分时盘口",
+        "账户与T+1",
+        "操作计划",
+        "反证条件与复盘",
+    ]
+    assert completeness["must_use_reasoning_chain"] == ["结论", "数据证据", "技术位来源", "反证条件", "执行动作"]
+    assert completeness["coverage"]["technical_levels"] is True
+    assert completeness["coverage"]["order_book"] is True
+    assert completeness["coverage"]["account_constraints"] is True
     assert out["execution_checklist"]["data_reliability"]["quote"]["status"] == "ok"
     assert out["execution_checklist"]["intraday_read"]["above_avg_price"] is True
     assert out["execution_checklist"]["intraday_read"]["below_cost"] is False
@@ -400,6 +426,10 @@ def test_stock_intraday_analysis_aggressive_score_penalizes_weak_data_quality() 
     assert out["execution_checklist"]["data_reliability"]["intraday"]["status"] == "failed"
     assert out["execution_checklist"]["execution_window"]["immediate_action"] == "只观察，等待关键盘中数据恢复"
     assert out["review_record"]["data_quality_summary"]["intraday_status"] == "failed"
+    assert out["technical_interpretation"]["intraday_state"] == "分时不可确认"
+    assert "分时缺失" in out["technical_interpretation"]["risk_tags"]
+    assert out["response_completeness_check"]["coverage"]["intraday_vwap"] is False
+    assert "分时均价缺失" in out["response_completeness_check"]["missing_or_degraded_items"]
 
 
 def test_verify_candidates_marks_repeated_names_as_tracking_not_new_recommendations() -> None:

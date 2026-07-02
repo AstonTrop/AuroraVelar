@@ -1650,6 +1650,207 @@ class MarketDataService:
             ],
         }
 
+    def _technical_interpretation(
+        self,
+        *,
+        quote: dict[str, Any],
+        intraday: dict[str, Any],
+        order_book: dict[str, Any],
+        technical: dict[str, Any],
+        trading_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest_price = _nullable_float(quote.get("latest_price"))
+        ma5 = _nullable_float(technical.get("ma5"))
+        ma10 = _nullable_float(technical.get("ma10"))
+        ma20 = _nullable_float(technical.get("ma20"))
+        ma60 = _nullable_float(technical.get("ma60"))
+        recent_high_20 = _nullable_float(technical.get("recent_high_20"))
+        recent_low_20 = _nullable_float(technical.get("recent_low_20"))
+        boll_upper = _nullable_float(technical.get("boll_upper"))
+        boll_mid = _nullable_float(technical.get("boll_mid"))
+        boll_lower = _nullable_float(technical.get("boll_lower"))
+        atr = _nullable_float(technical.get("atr"))
+
+        rows = intraday.get("rows") if isinstance(intraday.get("rows"), list) else []
+        last_row = rows[-1] if rows else {}
+        previous_row = rows[-2] if len(rows) >= 2 else {}
+        last_intraday_price = _nullable_float(last_row.get("close") or last_row.get("price"))
+        avg_price = _nullable_float(last_row.get("avg_price") or last_row.get("vwap"))
+        last_volume = _nullable_float(last_row.get("volume"))
+        previous_volume = _nullable_float(previous_row.get("volume"))
+
+        risk_tags: list[str] = []
+        point_sources: list[str] = []
+
+        if latest_price is None or technical.get("status") != "ok":
+            trend_state = "日线不可确认"
+            risk_tags.append("日K缺失")
+        elif ma20 is not None and latest_price >= ma20 and (ma60 is None or latest_price >= ma60):
+            trend_state = "日线偏强"
+            point_sources.extend(["MA20", "MA60"])
+        elif ma20 is not None and latest_price >= ma20:
+            trend_state = "日线修复中"
+            point_sources.append("MA20")
+            if ma60 is not None:
+                point_sources.append("MA60压力")
+        elif ma20 is not None:
+            trend_state = "日线偏弱"
+            point_sources.append("MA20")
+            risk_tags.append("未站稳MA20")
+        else:
+            trend_state = "日线结构不足"
+            risk_tags.append("均线缺失")
+
+        if intraday.get("status") != "ok" or not rows:
+            intraday_state = "分时不可确认"
+            risk_tags.append("分时缺失")
+        elif last_intraday_price is not None and avg_price is not None and last_intraday_price >= avg_price:
+            intraday_state = "分时偏强"
+            point_sources.append("分时均价")
+        elif last_intraday_price is not None and avg_price is not None:
+            intraday_state = "分时偏弱"
+            point_sources.append("分时均价")
+            risk_tags.append("现价低于分时均价")
+        else:
+            intraday_state = "分时均价不足"
+            risk_tags.append("分时均价缺失")
+
+        volume_ratio = _nullable_float(quote.get("volume_ratio"))
+        turnover_rate = _nullable_float(quote.get("turnover_rate"))
+        if last_volume is not None and previous_volume is not None:
+            if last_volume > previous_volume * 1.2:
+                volume_state = "最近1分钟放量"
+            elif last_volume < previous_volume * 0.8:
+                volume_state = "最近1分钟缩量"
+            else:
+                volume_state = "最近1分钟量能平稳"
+            point_sources.append("1分钟成交量")
+        elif volume_ratio is not None:
+            volume_state = f"量比{volume_ratio:.2f}，需结合分时量能确认"
+            point_sources.append("量比")
+        else:
+            volume_state = "量能不可确认"
+            risk_tags.append("量能缺失")
+
+        support_levels = []
+        for name, price, source in [
+            ("分时均价", avg_price, "分时均价"),
+            ("MA20", ma20, "20日均线"),
+            ("20日低点", recent_low_20, "近20日低点"),
+            ("BOLL下轨", boll_lower, "BOLL"),
+        ]:
+            if price is not None and price > 0:
+                support_levels.append({"name": name, "price": price, "source": source})
+
+        resistance_levels = []
+        for name, price, source in [
+            ("MA5", ma5, "5日均线"),
+            ("MA10", ma10, "10日均线"),
+            ("MA60", ma60, "60日均线"),
+            ("BOLL中轨", boll_mid, "BOLL"),
+            ("BOLL上轨", boll_upper, "BOLL"),
+            ("20日高点", recent_high_20, "近20日高点"),
+        ]:
+            if price is not None and price > 0:
+                resistance_levels.append({"name": name, "price": price, "source": source})
+
+        if order_book.get("status") != "ok":
+            risk_tags.append("盘口缺失")
+        elif order_book.get("actionability") not in {None, "可买"}:
+            risk_tags.append(str(order_book.get("actionability")))
+        else:
+            point_sources.append("五档盘口")
+
+        if atr is not None:
+            point_sources.append("ATR")
+
+        turnaround_parts = []
+        if avg_price is not None:
+            turnaround_parts.append(f"重新站回分时均价{avg_price:.2f}")
+        if ma20 is not None:
+            turnaround_parts.append(f"不破MA20 {ma20:.2f}")
+        if recent_high_20 is not None:
+            turnaround_parts.append(f"放量突破近20日压力{recent_high_20:.2f}")
+        turnaround_condition = "，且".join(turnaround_parts) if turnaround_parts else "实时分时、均线和盘口数据恢复后再判断转强条件"
+
+        return {
+            "purpose": "把原始技术指标翻译成GPT必须引用的交易语言，避免只给模糊结论",
+            "trend_state": trend_state,
+            "intraday_state": intraday_state,
+            "volume_state": volume_state,
+            "support_levels": support_levels,
+            "resistance_levels": resistance_levels,
+            "buy_trigger": trading_plan.get("buy_condition"),
+            "sell_trigger": trading_plan.get("take_profit_line"),
+            "failure_line": trading_plan.get("failure_line"),
+            "turnaround_condition": turnaround_condition,
+            "point_sources": list(dict.fromkeys(point_sources)),
+            "risk_tags": list(dict.fromkeys(risk_tags)) or ["暂无明显技术硬伤，但仍需等待触发条件"],
+            "required_reasoning_chain": {
+                "结论": "先给持有/减仓/观察/买入条件，不要先讲故事",
+                "数据证据": "引用实时价、分时均价、量能、盘口、板块和账户约束",
+                "技术位来源": "说明买点、卖点、失败线来自哪些技术字段",
+                "反证条件": "写明什么情况说明原判断失效或需要升级",
+                "执行动作": "量化到价格区间、股数或等待条件",
+            },
+        }
+
+    def _response_completeness_check(
+        self,
+        *,
+        data_quality: dict[str, Any],
+        technical_interpretation: dict[str, Any],
+        board: dict[str, Any],
+        market: dict[str, Any],
+        account: dict[str, Any],
+    ) -> dict[str, Any]:
+        required_sections = [
+            "数据来源与质量",
+            "市场状态",
+            "板块状态",
+            "个股技术结构",
+            "分时盘口",
+            "账户与T+1",
+            "操作计划",
+            "反证条件与复盘",
+        ]
+        support_levels = technical_interpretation.get("support_levels") if isinstance(technical_interpretation, dict) else []
+        resistance_levels = technical_interpretation.get("resistance_levels") if isinstance(technical_interpretation, dict) else []
+        coverage = {
+            "data_quality": bool(data_quality),
+            "market_state": market.get("status") == "ok",
+            "board_state": data_quality.get("board_status") in {"ok", "partial"},
+            "technical_levels": bool(support_levels) and bool(resistance_levels),
+            "intraday_vwap": data_quality.get("intraday_status") == "ok"
+            and "分时均价" in (technical_interpretation.get("point_sources") or []),
+            "order_book": data_quality.get("order_book_status") == "ok",
+            "account_constraints": account.get("status") == "ok",
+            "review_plan": True,
+        }
+        missing_or_degraded_items = []
+        if not coverage["market_state"]:
+            missing_or_degraded_items.append("市场状态缺失")
+        if not coverage["board_state"]:
+            missing_or_degraded_items.append("板块判断不足")
+        if not coverage["technical_levels"]:
+            missing_or_degraded_items.append("技术支撑压力不足")
+        if not coverage["intraday_vwap"]:
+            missing_or_degraded_items.append("分时均价缺失")
+        if not coverage["order_book"]:
+            missing_or_degraded_items.append("盘口缺失")
+        if data_quality.get("recent_trades_status") != "ok":
+            missing_or_degraded_items.append("逐笔成交缺失，主动买卖判断降级")
+
+        return {
+            "purpose": "约束GPT输出完整分析；缺失项必须明说并降低结论强度",
+            "required_sections": required_sections,
+            "must_use_reasoning_chain": ["结论", "数据证据", "技术位来源", "反证条件", "执行动作"],
+            "coverage": coverage,
+            "missing_or_degraded_items": missing_or_degraded_items,
+            "reply_rule": "最终回复必须覆盖required_sections；每只重点股必须按must_use_reasoning_chain写，不允许只给结论",
+            "anti_lazy_rule": "如果无法覆盖某段，不要省略；写明缺失原因、影响和结论降级方式",
+        }
+
     def _execution_checklist(
         self,
         *,
@@ -1912,6 +2113,20 @@ class MarketDataService:
             decision_score=decision_score,
         )
         freshness = "failed" if quote.get("status") == "failed" else freshness_for_phase(phase)
+        technical_interpretation = self._technical_interpretation(
+            quote=quote,
+            intraday=intraday,
+            order_book=order_book,
+            technical=technical,
+            trading_plan=trading_plan,
+        )
+        response_completeness_check = self._response_completeness_check(
+            data_quality=data_quality,
+            technical_interpretation=technical_interpretation,
+            board=board,
+            market=market,
+            account=account,
+        )
         execution_checklist = self._execution_checklist(
             quote=quote,
             intraday=intraday,
@@ -1951,6 +2166,8 @@ class MarketDataService:
                 "account": account,
                 "decision_score": decision_score,
                 "trading_plan": trading_plan,
+                "technical_interpretation": technical_interpretation,
+                "response_completeness_check": response_completeness_check,
                 "execution_checklist": execution_checklist,
                 "review_record": review_record,
             }
