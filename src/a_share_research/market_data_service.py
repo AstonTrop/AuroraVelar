@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
+import contextlib
+import io
 import json
 import os
 import re
@@ -257,6 +259,31 @@ class AkshareMarketDataProvider:
         board_df, _source = fetch_board_snapshot()
         return board_df
 
+    def board_constituents(self, board: dict[str, Any]) -> pd.DataFrame:
+        board_name = str(_pick(board, "board_name", "板块名称", default="") or "")
+        board_type = str(_pick(board, "board_type", default="") or "")
+        if not board_name:
+            return pd.DataFrame()
+        ak = self._ak()
+        if "概念" in board_type:
+            raw = ak.stock_board_concept_cons_em(symbol=board_name)
+        else:
+            raw = ak.stock_board_industry_cons_em(symbol=board_name)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        code_col = _quote_col(raw, "代码", "code", "股票代码")
+        name_col = _quote_col(raw, "名称", "name", "股票名称")
+        change_col = _quote_col(raw, "涨跌幅", "change_pct", "changepercent")
+        if code_col is None:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            {
+                "code": raw[code_col].map(normalize_code),
+                "name": raw[name_col].astype(str) if name_col else "",
+                "change_pct": raw[change_col].map(parse_numeric) if change_col else 0.0,
+            }
+        )
+
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         report_date = report_date or date.today()
         start_date = report_date.replace(year=max(1990, report_date.year - 1)).strftime("%Y%m%d")
@@ -272,7 +299,32 @@ class AkshareMarketDataProvider:
         raise RuntimeError("AkShare intraday method is not enabled for this service")
 
     def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
-        raise RuntimeError("AkShare recent-trades method is not enabled for this service")
+        tick_df = self._ak().stock_zh_a_tick_tx_js(symbol=_tencent_symbol(code))
+        if tick_df is None or tick_df.empty:
+            return pd.DataFrame()
+        rows = []
+        for _, row in tick_df.head(limit).iterrows():
+            row_dict = row.to_dict()
+            side_text = str(_pick(row_dict, "性质", "side", default="") or "")
+            if "买" in side_text:
+                side = "buy"
+            elif "卖" in side_text:
+                side = "sell"
+            elif "中" in side_text:
+                side = "neutral"
+            else:
+                side = "unknown"
+            raw_volume = _nullable_float(_pick(row_dict, "成交量", "volume"))
+            rows.append(
+                {
+                    "time": str(_pick(row_dict, "成交时间", "time", default="")),
+                    "price": _nullable_float(_pick(row_dict, "成交价格", "price")),
+                    "volume": raw_volume * 100 if raw_volume is not None else None,
+                    "amount": _nullable_float(_pick(row_dict, "成交金额", "amount")),
+                    "side": side,
+                }
+            )
+        return pd.DataFrame.from_records(rows)
 
     def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
         report_date = report_date or date.today()
@@ -477,6 +529,7 @@ class SinaMarketDataProvider:
             rows.append(
                 {
                     "board_type": board_type,
+                    "label": parts[0],
                     "board_name": parts[1],
                     "change_pct": parse_numeric(parts[5]),
                     "up_count": 0.0,
@@ -493,6 +546,34 @@ class SinaMarketDataProvider:
         out["up_ratio"] = 0.0
         out["board_action"] = out["change_pct"].map(lambda value: "只观察" if parse_numeric(value) >= 0 else "回避")
         return out
+
+    def board_constituents(self, board: dict[str, Any]) -> pd.DataFrame:
+        label = str(_pick(board, "label", default="") or "")
+        if not label:
+            return pd.DataFrame()
+        try:
+            import akshare as ak  # noqa: PLC0415
+
+            # AkShare's Sina sector detail emits tqdm progress; keep API logs clean.
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                raw = ak.stock_sector_detail(sector=label)
+        except Exception:
+            return pd.DataFrame()
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        code_col = _quote_col(raw, "code", "股票代码", "代码")
+        name_col = _quote_col(raw, "name", "股票名称", "名称")
+        change_col = _quote_col(raw, "changepercent", "涨跌幅", "change_pct")
+        if code_col is None:
+            return pd.DataFrame()
+        out = pd.DataFrame(
+            {
+                "code": raw[code_col].map(normalize_code),
+                "name": raw[name_col].astype(str) if name_col else "",
+                "change_pct": raw[change_col].map(parse_numeric) if change_col else 0.0,
+            }
+        )
+        return out[out["code"].ne("")].reset_index(drop=True)
 
     def boards(self) -> pd.DataFrame:
         frames = []
@@ -782,6 +863,9 @@ class FallbackMarketDataProvider:
     def zt_pool(self, report_date: date | None = None) -> pd.DataFrame:
         return self._with_fallback("zt_pool", report_date=report_date)
 
+    def board_constituents(self, board: dict[str, Any]) -> pd.DataFrame:
+        return self._with_fallback("board_constituents", board)
+
 
 class CloudMarketDataProvider:
     """Route each endpoint to the lightest reliable public data source."""
@@ -838,6 +922,9 @@ class CloudMarketDataProvider:
 
     def boards(self) -> pd.DataFrame:
         return self.board_provider.boards()
+
+    def board_constituents(self, board: dict[str, Any]) -> pd.DataFrame:
+        return self.board_provider.board_constituents(board)
 
     def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
         return self.history_provider.hist(code, report_date=report_date)
@@ -1329,7 +1416,62 @@ class MarketDataService:
             matched = work[work[leader_col].map(normalize_code).eq(code)]
             if not matched.empty:
                 work = pd.concat([matched, work.drop(matched.index)], ignore_index=True)
-        if leader_col and matched.empty:
+        industry_rows = work[work.get("board_type", "").astype(str).str.contains("行业", na=False)] if "board_type" in work.columns else pd.DataFrame()
+        concept_rows = work[work.get("board_type", "").astype(str).str.contains("概念", na=False)] if "board_type" in work.columns else pd.DataFrame()
+
+        def constituent_match(row: dict[str, Any]) -> dict[str, Any] | None:
+            if not hasattr(self.provider, "board_constituents"):
+                return None
+            try:
+                constituents = self.provider.board_constituents(row)
+            except Exception:
+                return None
+            if constituents is None or constituents.empty:
+                return None
+            code_col = _quote_col(constituents, "code", "代码", "股票代码")
+            if code_col is None:
+                return None
+            matched_constituent = constituents[constituents[code_col].map(normalize_code).eq(code)]
+            if matched_constituent.empty:
+                return None
+            item = matched_constituent.iloc[0].to_dict()
+            return {
+                "code": normalize_code(_pick(item, "code", "代码", "股票代码", default=code)),
+                "name": str(_pick(item, "name", "名称", "股票名称", default="") or ""),
+                "change_pct": _nullable_float(_pick(item, "change_pct", "涨跌幅", "changepercent")),
+            }
+
+        def find_constituent_board(rows: pd.DataFrame) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            for row in rows.to_dict(orient="records"):
+                matched_stock = constituent_match(row)
+                if matched_stock:
+                    row = dict(row)
+                    row["matched_by"] = "constituent"
+                    row["matched_stock"] = matched_stock
+                    return row, matched_stock
+            return None, None
+
+        industry_match, industry_stock = find_constituent_board(industry_rows) if not industry_rows.empty else (None, None)
+        concept_matches: list[dict[str, Any]] = []
+        for row in concept_rows.head(20).to_dict(orient="records"):
+            matched_stock = constituent_match(row)
+            if matched_stock:
+                row = dict(row)
+                row["matched_by"] = "constituent"
+                row["matched_stock"] = matched_stock
+                concept_matches.append(row)
+        if industry_match:
+            work = pd.concat(
+                [
+                    pd.DataFrame([industry_match]),
+                    pd.DataFrame(concept_matches),
+                    work,
+                ],
+                ignore_index=True,
+            )
+            industry_rows = work[work.get("board_type", "").astype(str).str.contains("行业", na=False)] if "board_type" in work.columns else pd.DataFrame()
+            concept_rows = work[work.get("board_type", "").astype(str).str.contains("概念", na=False)] if "board_type" in work.columns else pd.DataFrame()
+        elif leader_col and matched.empty:
             return {
                 "status": "partial",
                 "fetched_at": fetched_time,
@@ -1338,8 +1480,7 @@ class MarketDataService:
                 "core_stocks": [],
                 "error": "Stock-to-board mapping is unavailable from current public board source",
             }
-        industry_rows = work[work.get("board_type", "").astype(str).str.contains("行业", na=False)] if "board_type" in work.columns else pd.DataFrame()
-        concept_rows = work[work.get("board_type", "").astype(str).str.contains("概念", na=False)] if "board_type" in work.columns else pd.DataFrame()
+
         industry_row = _first_row(industry_rows if not industry_rows.empty else work)
 
         def board_item(row: dict[str, Any]) -> dict[str, Any]:
@@ -1362,6 +1503,8 @@ class MarketDataService:
                 "leader_name": str(_pick(row, "leader", "leader_name", "领涨股", default="") or ""),
                 "leader_change_pct": _nullable_float(_pick(row, "leader_change_pct", "领涨股涨跌幅")),
                 "limit_up_count": _nullable_int(_pick(row, "limit_up_count", "涨停家数")),
+                "matched_by": _pick(row, "matched_by", default="leader" if normalize_code(_pick(row, "leader_code", "领涨股代码", default="")) == code else None),
+                "matched_stock": _pick(row, "matched_stock", default=None),
             }
 
         concepts = [board_item(row.to_dict()) for _, row in concept_rows.head(5).iterrows()]

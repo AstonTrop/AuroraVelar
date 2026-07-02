@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 
 from src.a_share_research.market_data_service import (
+    AkshareMarketDataProvider,
     CloudMarketDataProvider,
     EastmoneyDirectMarketDataProvider,
     FallbackMarketDataProvider,
@@ -578,6 +579,46 @@ def test_stock_intraday_analysis_does_not_invent_unmatched_board() -> None:
     assert out["board"]["industry"] is None
 
 
+def test_stock_intraday_analysis_matches_board_by_constituents_when_not_leader() -> None:
+    class ConstituentProvider(StaticMarketDataProvider):
+        def board_constituents(self, board: dict[str, object]) -> pd.DataFrame:
+            if board.get("label") == "new_feed":
+                return pd.DataFrame(
+                    [
+                        {"code": "002100", "name": "天康生物", "change_pct": 1.39},
+                        {"code": "000001", "name": "平安银行", "change_pct": -0.2},
+                    ]
+                )
+            return pd.DataFrame()
+
+    provider = ConstituentProvider(
+        quotes=pd.DataFrame([{"代码": "002100", "名称": "天康生物", "最新价": 8.76, "涨跌幅": 1.39}]),
+        boards_df=pd.DataFrame(
+            [
+                {
+                    "board_type": "行业",
+                    "label": "new_feed",
+                    "board_name": "饲料",
+                    "change_pct": 2.1,
+                    "rank": 3,
+                    "up_count": 18,
+                    "down_count": 5,
+                    "leader_code": "000999",
+                    "leader": "别的股票",
+                    "leader_change_pct": 6.2,
+                }
+            ]
+        ),
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis({"code": "002100"})
+
+    assert out["board"]["status"] == "ok"
+    assert out["board"]["industry"]["name"] == "饲料"
+    assert out["board"]["industry"]["matched_by"] == "constituent"
+    assert out["board_stock_alignment"]["status"] == "ok"
+
+
 def test_technical_endpoint_returns_trade_points() -> None:
     provider = StaticMarketDataProvider(
         hist={
@@ -707,9 +748,38 @@ def test_sina_provider_parses_boards() -> None:
     boards = provider.boards()
 
     assert boards.iloc[0]["board_name"] == "电力行业"
+    assert boards.iloc[0]["label"] == "new_dlhy"
     assert boards.iloc[0]["change_pct"] == 2.23
     assert boards.iloc[0]["leader_code"] == "600021"
     assert boards.iloc[0]["leader"] == "上海电力"
+
+
+def test_akshare_provider_parses_recent_trades_from_tencent_tick() -> None:
+    class FakeAk:
+        @staticmethod
+        def stock_zh_a_tick_tx_js(symbol: str) -> pd.DataFrame:
+            assert symbol == "sh600879"
+            return pd.DataFrame(
+                [
+                    {"成交时间": "09:30:02", "成交价格": 21.00, "成交量": 726, "成交金额": 1524615, "性质": "买盘"},
+                    {"成交时间": "09:30:05", "成交价格": 21.07, "成交量": 835, "成交金额": 1756641, "性质": "卖盘"},
+                ]
+            )
+
+    class Provider(AkshareMarketDataProvider):
+        def _ak(self):
+            return FakeAk
+
+    trades = Provider().recent_trades("600879", limit=1)
+
+    assert list(trades.columns) == ["time", "price", "volume", "amount", "side"]
+    assert trades.iloc[0].to_dict() == {
+        "time": "09:30:02",
+        "price": 21.0,
+        "volume": 72600.0,
+        "amount": 1524615.0,
+        "side": "buy",
+    }
 
 
 def test_sina_provider_parses_daily_hist() -> None:
