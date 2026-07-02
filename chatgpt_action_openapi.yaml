@@ -77,7 +77,7 @@ paths:
     post:
       operationId: getStockIntradayAnalysis
       summary: 获取单只股票盘中交易分析数据结构
-      description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、板块、市场状态、涨停池关联、账户约束、偏进攻交易评分和交易计划，用于盘中买卖点判断。
+      description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、板块、市场状态、涨停池关联、账户约束、偏进攻交易评分、交易计划、执行检查清单和复盘记录，用于盘中买卖点判断。
       requestBody:
         required: true
         content:
@@ -124,7 +124,7 @@ paths:
                 - code
       responses:
         "200":
-          description: 单票盘中交易分析用完整数据结构、数据质量标记、decision_score和trading_plan
+          description: 单票盘中交易分析用完整数据结构、数据质量标记、decision_score、trading_plan、execution_checklist和review_record
   /candidates/actionable:
     get:
       operationId: getActionableCandidates
@@ -154,7 +154,7 @@ paths:
     post:
       operationId: verifyCandidates
       summary: 核验由ChatGPT或用户提供的候选股票
-      description: 对候选股票逐只核验实时价格、盘口可执行性、技术点位、现金约束、主板范围和追高风险，用于判断是否值得推荐。
+      description: 对候选股票逐只核验实时价格、盘口可执行性、技术点位、现金约束、主板范围、追高风险和候选生命周期，用于判断是否值得推荐，并避免重复推荐老股票。
       requestBody:
         required: true
         content:
@@ -165,6 +165,16 @@ paths:
                 cash:
                   type: number
                   description: 当前可用现金，用于判断是否买得起一手
+                previous_recommendations:
+                  type: array
+                  description: 最近已经推荐或重点观察过的股票，用于去重；重复股票没有新实时证据时应进入观察池而不是再次作为新推荐
+                  items:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      name:
+                        type: string
                 candidates:
                   type: array
                   items:
@@ -184,7 +194,7 @@ paths:
                 - candidates
       responses:
         "200":
-          description: 每只候选的实时核验结果、买卖止损点和最终推荐评级
+          description: 每只候选的实时核验结果、买卖止损点、候选生命周期candidate_lifecycle和最终推荐评级
   /portfolio/analyze:
     post:
       operationId: analyzePortfolio

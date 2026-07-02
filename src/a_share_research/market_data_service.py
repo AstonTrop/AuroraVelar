@@ -1650,6 +1650,177 @@ class MarketDataService:
             ],
         }
 
+    def _execution_checklist(
+        self,
+        *,
+        quote: dict[str, Any],
+        intraday: dict[str, Any],
+        order_book: dict[str, Any],
+        recent_trades: dict[str, Any],
+        technical: dict[str, Any],
+        board: dict[str, Any],
+        market: dict[str, Any],
+        account: dict[str, Any],
+        data_quality: dict[str, Any],
+        trading_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest_price = _nullable_float(quote.get("latest_price"))
+        positions = account.get("positions") if isinstance(account.get("positions"), list) else []
+        matched_position = next(
+            (
+                item
+                for item in positions
+                if normalize_code(item.get("code", "")) == normalize_code(quote.get("code", ""))
+            ),
+            None,
+        )
+        cost = _nullable_float(matched_position.get("cost")) if isinstance(matched_position, dict) else None
+        available = int(matched_position.get("available") or 0) if isinstance(matched_position, dict) else None
+        shares = int(matched_position.get("shares") or 0) if isinstance(matched_position, dict) else None
+
+        rows = intraday.get("rows") if isinstance(intraday.get("rows"), list) else []
+        last_row = rows[-1] if rows else {}
+        last_intraday_price = _nullable_float(last_row.get("close") or last_row.get("price"))
+        avg_price = _nullable_float(last_row.get("avg_price") or last_row.get("vwap"))
+        intraday_price = last_intraday_price if last_intraday_price is not None else latest_price
+        above_avg_price = (
+            intraday_price >= avg_price
+            if intraday_price is not None and avg_price is not None
+            else None
+        )
+        below_cost = latest_price < cost if latest_price is not None and cost is not None else None
+
+        if data_quality.get("intraday_status") != "ok" or data_quality.get("order_book_status") != "ok":
+            immediate_action = "只观察，等待关键盘中数据恢复"
+        elif above_avg_price is True and below_cost is not True:
+            immediate_action = "可继续观察买盘承接，等待交易计划触发"
+        elif above_avg_price is False:
+            immediate_action = "暂不追买，先看能否重新站回分时均价"
+        elif below_cost is True:
+            immediate_action = "低于成本线，先观察反抽质量，不盲目加仓"
+        else:
+            immediate_action = "数据基本可用，但买卖需等待触发条件"
+
+        bid_total = sum(_nullable_float(item.get("volume")) or 0 for item in order_book.get("bid", []) if isinstance(item, dict))
+        ask_total = sum(_nullable_float(item.get("volume")) or 0 for item in order_book.get("ask", []) if isinstance(item, dict))
+        sell_pressure_level = "unknown"
+        if bid_total or ask_total:
+            sell_pressure_level = "偏重" if ask_total > bid_total * 1.2 else "均衡" if ask_total >= bid_total * 0.8 else "较轻"
+
+        return {
+            "purpose": "盘中执行前检查清单，帮助GPT避免只讲逻辑、不讲能否动手",
+            "data_reliability": {
+                "quote": {
+                    "status": data_quality.get("quote_status"),
+                    "fetched_at": quote.get("fetched_at"),
+                    "freshness": quote.get("freshness"),
+                },
+                "intraday": {
+                    "status": data_quality.get("intraday_status"),
+                    "fetched_at": intraday.get("fetched_at"),
+                },
+                "order_book": {
+                    "status": data_quality.get("order_book_status"),
+                    "fetched_at": order_book.get("fetched_at"),
+                },
+                "recent_trades": {
+                    "status": data_quality.get("recent_trades_status"),
+                    "fetched_at": recent_trades.get("fetched_at"),
+                },
+                "technical": {
+                    "status": data_quality.get("technical_status"),
+                    "fetched_at": technical.get("fetched_at"),
+                },
+                "board": {
+                    "status": data_quality.get("board_status"),
+                    "fetched_at": board.get("fetched_at"),
+                },
+                "market": {
+                    "status": data_quality.get("market_status"),
+                    "fetched_at": market.get("fetched_at"),
+                },
+            },
+            "intraday_read": {
+                "latest_price": latest_price,
+                "last_intraday_price": last_intraday_price,
+                "avg_price": avg_price,
+                "cost": cost,
+                "above_avg_price": above_avg_price,
+                "below_cost": below_cost,
+                "intraday_pattern": "均价上方" if above_avg_price is True else "均价下方" if above_avg_price is False else "分时均价不可确认",
+                "volume_read": "需结合最近3-5根1分钟量能变化判断放量突破或缩量回踩",
+            },
+            "order_book_read": {
+                "bid_total": bid_total or None,
+                "ask_total": ask_total or None,
+                "sell_pressure_level": sell_pressure_level,
+                "needs_active_buying_above": order_book.get("ask", [{}])[0].get("price") if order_book.get("ask") else None,
+                "watch_minutes": 5,
+                "note": "卖压偏重时，不把盘口静态买盘当作强承接；至少观察3-5分钟主动成交",
+            },
+            "account_constraints": {
+                "shares": shares,
+                "available": available,
+                "t_plus_1_locked": shares is not None and available is not None and available < shares,
+                "cash": account.get("cash"),
+                "min_lot_cost": order_book.get("min_lot_cost"),
+            },
+            "execution_window": {
+                "immediate_action": immediate_action,
+                "hold_if": "站回或维持分时均价上方，且盘口卖压不继续扩大",
+                "sell_if": trading_plan.get("failure_line") or "跌破关键确认线且5-10分钟收不回",
+                "buy_if": trading_plan.get("buy_condition"),
+                "observe_until": "至少再观察3-5分钟分时均价、主动成交和卖一卖二压单变化",
+            },
+            "opportunity_cost": {
+                "check": "若板块和市场不配合，即使个股未破位，也要考虑资金占用效率",
+                "avoid": "不要因为之前反复推荐过就继续给买入结论，必须有新的实时证据",
+            },
+        }
+
+    def _review_record(
+        self,
+        *,
+        code: str,
+        quote: dict[str, Any],
+        data_quality: dict[str, Any],
+        decision_score: dict[str, Any],
+        trading_plan: dict[str, Any],
+        freshness: str,
+        fetched_at_value: str,
+    ) -> dict[str, Any]:
+        return {
+            "code": normalize_code(code),
+            "name": quote.get("name"),
+            "fetched_at": fetched_at_value,
+            "freshness": freshness,
+            "latest_price": quote.get("latest_price"),
+            "decision_score": decision_score.get("total_score"),
+            "probability_band": decision_score.get("probability_band"),
+            "suggested_action": decision_score.get("suggested_action"),
+            "buy_condition": trading_plan.get("buy_condition"),
+            "failure_line": trading_plan.get("failure_line"),
+            "take_profit_line": trading_plan.get("take_profit_line"),
+            "data_quality_summary": {
+                "quote_status": data_quality.get("quote_status"),
+                "intraday_status": data_quality.get("intraday_status"),
+                "order_book_status": data_quality.get("order_book_status"),
+                "recent_trades_status": data_quality.get("recent_trades_status"),
+                "technical_status": data_quality.get("technical_status"),
+                "board_status": data_quality.get("board_status"),
+                "market_status": data_quality.get("market_status"),
+            },
+            "next_review_fields": [
+                "next_trade_date_open",
+                "next_trade_date_high",
+                "next_trade_date_low",
+                "triggered_buy_condition",
+                "triggered_failure_line",
+                "actual_action",
+                "outcome_note",
+            ],
+        }
+
     def stock_intraday_analysis(self, payload: dict[str, Any]) -> dict[str, Any]:
         code = normalize_code(payload.get("code", ""))
         limit = int(payload.get("intraday_limit", 0) or 0) or None
@@ -1741,6 +1912,27 @@ class MarketDataService:
             decision_score=decision_score,
         )
         freshness = "failed" if quote.get("status") == "failed" else freshness_for_phase(phase)
+        execution_checklist = self._execution_checklist(
+            quote=quote,
+            intraday=intraday,
+            order_book=order_book,
+            recent_trades=recent_trades,
+            technical=technical,
+            board=board,
+            market=market,
+            account=account,
+            data_quality=data_quality,
+            trading_plan=trading_plan,
+        )
+        review_record = self._review_record(
+            code=code,
+            quote=quote,
+            data_quality=data_quality,
+            decision_score=decision_score,
+            trading_plan=trading_plan,
+            freshness=freshness,
+            fetched_at_value=top_fetched_at,
+        )
         return json_safe(
             {
                 "code": code,
@@ -1759,6 +1951,8 @@ class MarketDataService:
                 "account": account,
                 "decision_score": decision_score,
                 "trading_plan": trading_plan,
+                "execution_checklist": execution_checklist,
+                "review_record": review_record,
             }
         )
 
@@ -1878,9 +2072,80 @@ class MarketDataService:
             return self._unavailable(exc)
         return response_envelope({"code": normalize_code(code), **profile}, source=self.source)
 
+    def _previous_recommendation_codes(self, payload: dict[str, Any]) -> set[str]:
+        previous = payload.get("previous_recommendations", []) or []
+        codes: set[str] = set()
+        for item in previous:
+            if isinstance(item, dict):
+                code = normalize_code(item.get("code", ""))
+            else:
+                code = normalize_code(str(item))
+            if code:
+                codes.add(code)
+        return codes
+
+    def _candidate_lifecycle(
+        self,
+        *,
+        code: str,
+        verdict: str,
+        source_reason: Any,
+        previous_codes: set[str],
+    ) -> dict[str, Any]:
+        reason = str(source_reason or "")
+        new_evidence_keywords = [
+            "突破",
+            "站回",
+            "放量",
+            "板块转强",
+            "资金回流",
+            "盘口改善",
+            "公告",
+            "新高",
+            "修复",
+            "涨停",
+            "异动",
+            "回踩不破",
+        ]
+        has_new_evidence = any(keyword in reason for keyword in new_evidence_keywords)
+        repeated = code in previous_codes
+
+        if not repeated:
+            slot = "买入候选" if verdict == "可重点观察" else "观察池"
+            return {
+                "status": "新候选",
+                "recommendation_slot": slot,
+                "duplicate_note": "首次进入本轮候选；仍需通过实时行情、板块和技术触发确认",
+                "has_new_realtime_evidence": has_new_evidence,
+            }
+
+        if verdict == "不建议买入":
+            return {
+                "status": "淘汰候选",
+                "recommendation_slot": "淘汰池",
+                "duplicate_note": "重复候选且本次实时核验触发硬否决，不应继续作为买入推荐",
+                "has_new_realtime_evidence": has_new_evidence,
+            }
+
+        if has_new_evidence and verdict == "可重点观察":
+            return {
+                "status": "升级候选",
+                "recommendation_slot": "重点观察",
+                "duplicate_note": "虽然此前推荐过，但本次给出了新的实时证据，可重新进入重点观察",
+                "has_new_realtime_evidence": True,
+            }
+
+        return {
+            "status": "继续跟踪",
+            "recommendation_slot": "观察池",
+            "duplicate_note": "此前已经推荐过，且没有新的实时证据，不应作为新的买入推荐重复输出",
+            "has_new_realtime_evidence": has_new_evidence,
+        }
+
     def verify_candidates(self, payload: dict[str, Any]) -> dict[str, Any]:
         cash = float(payload.get("cash", 0.0) or 0.0)
         raw_candidates = payload.get("candidates", []) or []
+        previous_codes = self._previous_recommendation_codes(payload)
         codes = [normalize_code(item.get("code", "")) for item in raw_candidates]
         quotes_out = self.stock_quotes(codes)
         quotes = {}
@@ -1946,6 +2211,12 @@ class MarketDataService:
                 verdict = "可重点观察"
             else:
                 verdict = "只观察"
+            lifecycle = self._candidate_lifecycle(
+                code=code,
+                verdict=verdict,
+                source_reason=item.get("source_reason"),
+                previous_codes=previous_codes,
+            )
             results.append(
                 {
                     "code": code,
@@ -1962,6 +2233,7 @@ class MarketDataService:
                     "sell_point": tech.get("sell_point"),
                     "stop_loss_point": tech.get("stop_loss_point"),
                     "technical_point_sources": tech.get("technical_point_sources"),
+                    "candidate_lifecycle": lifecycle,
                 }
             )
         return response_envelope({"results": results}, source=self.source)

@@ -366,6 +366,22 @@ def test_stock_intraday_analysis_returns_trading_decision_data_contract() -> Non
     assert out["trading_plan"]["style_note"] == "偏进攻、弱保守；允许进攻仓位在65%以上，但必须有失败线"
     assert out["trading_plan"]["buy_condition"]
     assert out["trading_plan"]["failure_line"]
+    assert out["execution_checklist"]["data_reliability"]["quote"]["status"] == "ok"
+    assert out["execution_checklist"]["intraday_read"]["above_avg_price"] is True
+    assert out["execution_checklist"]["intraday_read"]["below_cost"] is False
+    assert out["execution_checklist"]["order_book_read"]["watch_minutes"] == 5
+    assert out["execution_checklist"]["execution_window"]["sell_if"]
+    assert out["review_record"]["code"] == "002100"
+    assert out["review_record"]["decision_score"] == out["decision_score"]["total_score"]
+    assert out["review_record"]["next_review_fields"] == [
+        "next_trade_date_open",
+        "next_trade_date_high",
+        "next_trade_date_low",
+        "triggered_buy_condition",
+        "triggered_failure_line",
+        "actual_action",
+        "outcome_note",
+    ]
 
 
 def test_stock_intraday_analysis_aggressive_score_penalizes_weak_data_quality() -> None:
@@ -381,6 +397,55 @@ def test_stock_intraday_analysis_aggressive_score_penalizes_weak_data_quality() 
     assert out["decision_score"]["total_score"] < 65
     assert out["decision_score"]["probability_band"] in {"中性", "低胜率", "不适合交易"}
     assert "缺少分时或盘口关键数据" in out["decision_score"]["risk_flags"]
+    assert out["execution_checklist"]["data_reliability"]["intraday"]["status"] == "failed"
+    assert out["execution_checklist"]["execution_window"]["immediate_action"] == "只观察，等待关键盘中数据恢复"
+    assert out["review_record"]["data_quality_summary"]["intraday_status"] == "failed"
+
+
+def test_verify_candidates_marks_repeated_names_as_tracking_not_new_recommendations() -> None:
+    class CandidateProvider(StaticMarketDataProvider):
+        def quotes(self) -> pd.DataFrame:
+            raise AssertionError("candidate verification should not scan the full market")
+
+        def quotes_for(self, codes: list[str]) -> pd.DataFrame:
+            normalized = {str(code).zfill(6) for code in codes}
+            return self.quotes_df[self.quotes_df["代码"].isin(normalized)].copy()
+
+    provider = CandidateProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "000725", "名称": "京东方A", "最新价": 8.7, "涨跌幅": 2.0},
+            ]
+        ),
+        bidasks={
+            "000725": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 8.7},
+                    {"item": "涨幅", "value": 2.0},
+                    {"item": "sell_1", "value": 8.71},
+                    {"item": "buy_1", "value": 8.7},
+                ]
+            ),
+        },
+        hist={
+            "000725": pd.DataFrame({"收盘": [5 + i * 0.05 for i in range(80)]}),
+        },
+    )
+
+    out = MarketDataService(provider=provider).verify_candidates(
+        {
+            "cash": 5000,
+            "previous_recommendations": [{"code": "000725", "name": "京东方A"}],
+            "candidates": [
+                {"code": "000725", "name": "京东方A", "source_reason": "之前观察过的面板方向"},
+            ],
+        }
+    )
+
+    item = out["data"]["results"][0]
+    assert item["candidate_lifecycle"]["status"] == "继续跟踪"
+    assert item["candidate_lifecycle"]["recommendation_slot"] == "观察池"
+    assert "没有新的实时证据" in item["candidate_lifecycle"]["duplicate_note"]
 
 
 def test_stock_intraday_analysis_does_not_invent_unmatched_board() -> None:
