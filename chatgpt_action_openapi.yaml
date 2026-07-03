@@ -139,7 +139,7 @@ paths:
                 - code
       responses:
         "200":
-          description: 单票盘中交易分析用完整数据结构。GPT必须重点使用 recent_3d_context、today_intraday_summary、candlestick_structure、moving_average_structure、volume_price_relation、relative_strength、support_resistance_zones、risk_volatility、order_book_interpretation、board_stock_alignment、position_risk_contribution、technical_level_layers、next_session_scenarios、decision_score、trading_plan、technical_interpretation、response_completeness_check、execution_checklist、review_log_receipt和review_record。
+          description: 单票盘中交易分析用完整数据结构。GPT必须重点使用 trade_setup_type、professional_technical_diagnosis、fundamental_diagnosis、sector_alignment、professional_scenario_plan、recent_3d_context、today_intraday_summary、support_resistance_zones、order_book_interpretation、board_stock_alignment、position_risk_contribution、technical_level_layers、next_session_scenarios、decision_score、trading_plan、technical_interpretation、response_completeness_check、execution_checklist、review_log_receipt和review_record。
   /candidates/actionable:
     get:
       operationId: getActionableCandidates
@@ -163,9 +163,15 @@ paths:
           schema:
             type: integer
             default: 20
+        - name: recent_codes
+          in: query
+          required: false
+          schema:
+            type: string
+          description: 近期已推荐或重点观察过的股票代码，逗号分隔；这些股票默认降级到观察池，避免重复推荐
       responses:
         "200":
-          description: 过滤ST、科创、涨停封板、现金不足后的候选股
+          description: 返回分层候选：candidates/buy_now为现在可买，wait_pullback为等回踩，wait_breakout为等突破，watch_only为只观察，rejected为剔除；不能把非buy_now写成推荐买入。
   /candidates/verify:
     post:
       operationId: verifyCandidates

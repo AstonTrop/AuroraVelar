@@ -2744,6 +2744,179 @@ class MarketDataService:
             "usage_note": "必须先判断板块，再判断个股；板块数据partial/failed时，买入结论自动降级。",
         }
 
+    def _trade_setup_type(
+        self,
+        *,
+        quote: dict[str, Any],
+        technical: dict[str, Any],
+        recent_3d_context: dict[str, Any],
+        today_intraday_summary: dict[str, Any],
+        board_stock_alignment: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest = _nullable_float(quote.get("latest_price"))
+        ma20 = _nullable_float(technical.get("ma20"))
+        ma60 = _nullable_float(technical.get("ma60"))
+        change_pct = _nullable_float(quote.get("change_pct"))
+        volume_ratio = _nullable_float(quote.get("volume_ratio"))
+        vwap_deviation = _nullable_float(today_intraday_summary.get("vwap_deviation_pct"))
+        direction_3d = str(recent_3d_context.get("direction_3d") or "不可确认")
+        stock_vs_board = str(board_stock_alignment.get("stock_vs_board") or "不可确认")
+        evidence: list[str] = []
+
+        setup_type = "弱转强修复"
+        if latest is not None and ma20 is not None and latest >= ma20 and (ma60 is None or latest >= ma60):
+            setup_type = "趋势持有"
+            evidence.append("现价站在MA20/MA60上方")
+        elif latest is not None and ma20 is not None and abs(latest - ma20) / latest <= 0.03:
+            setup_type = "趋势回踩"
+            evidence.append("现价贴近MA20，适合看回踩承接")
+        if volume_ratio is not None and volume_ratio >= 1.3 and change_pct is not None and change_pct > 0 and vwap_deviation is not None and vwap_deviation >= 0:
+            setup_type = "放量突破"
+            evidence.append("量比放大且价格在分时均价上方")
+        if change_pct is not None and change_pct >= 7.5:
+            setup_type = "高位加速"
+            evidence.append("日内涨幅偏大，不能当普通低吸处理")
+        if today_intraday_summary.get("phase_pattern") == "冲高回落":
+            setup_type = "冲高回落"
+            evidence.append("当日分时出现冲高回落")
+        if direction_3d != "不可确认":
+            evidence.append(f"近三日方向：{direction_3d}")
+        if stock_vs_board != "不可确认":
+            evidence.append(f"个股相对板块：{stock_vs_board}")
+
+        return {
+            "type": setup_type,
+            "evidence": list(dict.fromkeys(evidence)) or ["形态需要更多分时、板块和量能数据确认"],
+            "usage_note": "不同形态使用不同交易逻辑；高位加速和冲高回落默认不能直接当低吸买点。",
+        }
+
+    def _sector_alignment(self, board_stock_alignment: dict[str, Any]) -> dict[str, Any]:
+        status = str(board_stock_alignment.get("stock_vs_board") or "不可确认")
+        if status not in {"强于板块", "同步板块", "弱于板块"}:
+            status = "不可确认"
+        conclusion = {
+            "强于板块": "个股表现强于所属板块，可提高观察优先级，但仍要看分时和盘口。",
+            "同步板块": "个股跟随板块，需确认板块是否仍在扩散。",
+            "弱于板块": "板块有表现但个股掉队，买入/加仓要降级。",
+            "不可确认": "板块映射或板块涨跌缺失，不能把个股上涨简单归因于主线。",
+        }[status]
+        return {
+            "status": status,
+            "industry": board_stock_alignment.get("industry"),
+            "industry_change_pct": board_stock_alignment.get("industry_change_pct"),
+            "industry_rank": board_stock_alignment.get("industry_rank"),
+            "concepts": board_stock_alignment.get("concepts"),
+            "stock_role_estimate": board_stock_alignment.get("stock_role_estimate"),
+            "conclusion": conclusion,
+            "usage_note": "持仓和候选都必须结合板块；板块缺失时，进攻结论自动降级。",
+        }
+
+    def _professional_technical_diagnosis(
+        self,
+        *,
+        trade_setup_type: dict[str, Any],
+        technical_interpretation: dict[str, Any],
+        recent_3d_context: dict[str, Any],
+        today_intraday_summary: dict[str, Any],
+        support_resistance_zones: dict[str, Any],
+        order_book_interpretation: dict[str, Any],
+    ) -> dict[str, Any]:
+        key_evidence: list[str] = []
+        for field, label in [
+            ("trend_state", "日线"),
+            ("intraday_state", "分时"),
+            ("volume_state", "量能"),
+        ]:
+            value = technical_interpretation.get(field)
+            if value:
+                key_evidence.append(f"{label}: {value}")
+        if recent_3d_context.get("direction_3d"):
+            key_evidence.append(f"近三日: {recent_3d_context.get('direction_3d')}，量能{recent_3d_context.get('volume_trend_3d')}")
+        if today_intraday_summary.get("phase_pattern"):
+            key_evidence.append(f"当日分时: {today_intraday_summary.get('phase_pattern')}")
+        if order_book_interpretation.get("pressure"):
+            key_evidence.append(f"盘口: {order_book_interpretation.get('pressure')}")
+
+        return {
+            "level_source_policy": "区间优先，单点必须有来源",
+            "setup_type": trade_setup_type.get("type"),
+            "key_evidence": list(dict.fromkeys(key_evidence)),
+            "support_zones": support_resistance_zones.get("support_zones") or technical_interpretation.get("support_levels"),
+            "resistance_zones": support_resistance_zones.get("resistance_zones") or technical_interpretation.get("resistance_levels"),
+            "risk_tags": technical_interpretation.get("risk_tags", []),
+            "anti_formula_rule": "不能只说跌破某点就走；必须说明该点来自分时均价、近三日低点、均线、平台、ATR或盘口，并给反证条件。",
+        }
+
+    def _fundamental_diagnosis(self, quote: dict[str, Any], board: dict[str, Any]) -> dict[str, Any]:
+        total_mcap = _nullable_float(quote.get("total_market_cap"))
+        float_mcap = _nullable_float(quote.get("circulating_market_cap"))
+        industry = board.get("industry") if isinstance(board.get("industry"), dict) else {}
+        scale = "不可确认"
+        if total_mcap is not None:
+            if total_mcap >= 100_000_000_000:
+                scale = "大市值"
+            elif total_mcap >= 20_000_000_000:
+                scale = "中等市值"
+            else:
+                scale = "小市值"
+        known = [value for value in [total_mcap, float_mcap, industry.get("name") if industry else None] if value not in (None, "")]
+        return {
+            "status": "partial" if known else "failed",
+            "industry": industry.get("name") if industry else None,
+            "market_cap_style": scale,
+            "total_market_cap": total_mcap,
+            "circulating_market_cap": float_mcap,
+            "valuation": {
+                "pe": None,
+                "pb": None,
+                "note": "当前公开实时接口未稳定提供PE/PB，不能编造估值结论。",
+            },
+            "quality_factors": {
+                "profit_trend": "需要财报/研报补充",
+                "roe": None,
+                "cash_flow": "需要财报补充",
+                "debt_pressure": "需要财报补充",
+            },
+            "usage_note": "基本面用于判断是否值得继续占仓，不用于盘中精确买卖点；缺少财报字段时只能降级为背景判断。",
+        }
+
+    def _professional_scenario_plan(
+        self,
+        *,
+        quote: dict[str, Any],
+        trade_setup_type: dict[str, Any],
+        sector_alignment: dict[str, Any],
+        technical_level_layers: dict[str, Any],
+        position_risk_contribution: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest = _nullable_float(quote.get("latest_price"))
+        setup = trade_setup_type.get("type")
+        sector_status = sector_alignment.get("status")
+        shares = position_risk_contribution.get("shares")
+        available = position_risk_contribution.get("available")
+        resistance_item = technical_level_layers.get("take_profit_reference") or technical_level_layers.get("turn_strong_line") or {}
+        support_item = technical_level_layers.get("hard_stop_line") or technical_level_layers.get("intraday_strength_line") or {}
+        resistance = resistance_item.get("price")
+        resistance_source = resistance_item.get("source")
+        support = support_item.get("price")
+        support_source = support_item.get("source")
+        resistance_text = f"{resistance}（来源：{resistance_source}）" if resistance is not None else "上方压力区"
+        support_text = f"{support}（来源：{support_source}）" if support is not None else "关键支撑区"
+        return {
+            "upside": {
+                "condition": f"{setup}形态延续，价格站稳关键均价/压力区，且板块状态为{sector_status}",
+                "action": f"持仓{shares or 0}股先观察；若有可用股{available or 0}股，接近{resistance_text}放量滞涨再考虑分批兑现。",
+            },
+            "base": {
+                "condition": "价格围绕分时均价和成本线震荡，板块没有明显扩散",
+                "action": "不追涨，等待站稳或跌破后的确认信号；小账户优先保留现金主动权。",
+            },
+            "downside": {
+                "condition": f"跌破{support_text}且5-10分钟收不回，或板块转弱",
+                "action": "可卖仓优先降风险；available=0时只制定明日处理线，不能建议今天卖。",
+            },
+        }
+
     def _position_risk_contribution(self, quote: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
         positions = account.get("positions") if isinstance(account.get("positions"), list) else []
         matched = next((item for item in positions if normalize_code(item.get("code", "")) == normalize_code(quote.get("code", ""))), {})
@@ -3068,13 +3241,37 @@ class MarketDataService:
         order_book_interpretation = self._order_book_interpretation(order_book)
         board_stock_alignment = self._board_stock_alignment(quote, board)
         position_risk_contribution = self._position_risk_contribution(quote, account)
+        trade_setup_type = self._trade_setup_type(
+            quote=quote,
+            technical=technical,
+            recent_3d_context=recent_3d_context,
+            today_intraday_summary=today_intraday_summary,
+            board_stock_alignment=board_stock_alignment,
+        )
+        sector_alignment = self._sector_alignment(board_stock_alignment)
+        fundamental_diagnosis = self._fundamental_diagnosis(quote, board)
         technical_level_layers = self._technical_level_layers(
             quote=quote,
             intraday_summary=today_intraday_summary,
             support_resistance_zones=support_resistance_zones,
             position_risk_contribution=position_risk_contribution,
         )
+        professional_technical_diagnosis = self._professional_technical_diagnosis(
+            trade_setup_type=trade_setup_type,
+            technical_interpretation=technical_interpretation,
+            recent_3d_context=recent_3d_context,
+            today_intraday_summary=today_intraday_summary,
+            support_resistance_zones=support_resistance_zones,
+            order_book_interpretation=order_book_interpretation,
+        )
         next_session_scenarios = self._next_session_scenarios(
+            technical_level_layers=technical_level_layers,
+            position_risk_contribution=position_risk_contribution,
+        )
+        professional_scenario_plan = self._professional_scenario_plan(
+            quote=quote,
+            trade_setup_type=trade_setup_type,
+            sector_alignment=sector_alignment,
             technical_level_layers=technical_level_layers,
             position_risk_contribution=position_risk_contribution,
         )
@@ -3118,9 +3315,14 @@ class MarketDataService:
                 "risk_volatility": risk_volatility,
                 "order_book_interpretation": order_book_interpretation,
                 "board_stock_alignment": board_stock_alignment,
+                "sector_alignment": sector_alignment,
+                "trade_setup_type": trade_setup_type,
+                "professional_technical_diagnosis": professional_technical_diagnosis,
+                "fundamental_diagnosis": fundamental_diagnosis,
                 "position_risk_contribution": position_risk_contribution,
                 "technical_level_layers": technical_level_layers,
                 "next_session_scenarios": next_session_scenarios,
+                "professional_scenario_plan": professional_scenario_plan,
                 "review_log_receipt": review_log_receipt,
                 "response_completeness_check": response_completeness_check,
                 "execution_checklist": execution_checklist,
@@ -3410,15 +3612,80 @@ class MarketDataService:
             )
         return response_envelope({"results": results}, source=self.source)
 
-    def actionable_candidates(self, cash: float, price_limit: float = 20.0, limit: int = 20) -> dict[str, Any]:
+    def _candidate_execution_bucket(
+        self,
+        *,
+        latest_price: float | None,
+        day_change_pct: float | None,
+        actionability: str | None,
+        technical_score: float | None,
+        buy_point: float | None,
+    ) -> tuple[str, str, float | None]:
+        if latest_price is None or pd.isna(latest_price) or latest_price <= 0:
+            return "剔除", "现价缺失，不能判断是否可买", None
+        if actionability not in {None, "可买"}:
+            return "剔除", f"盘口/账户约束为{actionability}，不能作为可买候选", None
+        if day_change_pct is not None and not pd.isna(day_change_pct) and day_change_pct >= 7.5:
+            return "只观察", "日内涨幅偏高，当前更像追高而不是低吸/确认买点", None
+        distance_pct = None
+        if buy_point is not None and not pd.isna(buy_point) and buy_point > 0:
+            distance_pct = round((latest_price - buy_point) / latest_price * 100, 2)
+            if abs(distance_pct) <= 3.0:
+                return "现在可买", "现价距离技术买点在3%以内，具备当下执行条件", distance_pct
+            if distance_pct > 3.0:
+                return "等回踩", "现价已经高于技术买点超过3%，不适合直接追", distance_pct
+            return "等突破", "技术买点在现价上方超过3%，需要先突破确认", distance_pct
+        if technical_score is not None and not pd.isna(technical_score) and technical_score < 45:
+            return "只观察", "技术结构偏弱，暂不作为进攻候选", None
+        if day_change_pct is not None and -2.0 <= day_change_pct <= 5.5:
+            return "现在可买", "盘口可买且涨幅未过热，但技术买点缺失，需小仓并补充核验", None
+        return "只观察", "缺少可执行买点或涨跌状态不适合立即交易", distance_pct
+
+    def actionable_candidates(
+        self,
+        cash: float,
+        price_limit: float = 20.0,
+        limit: int = 20,
+        recent_codes: str | list[str] | None = None,
+    ) -> dict[str, Any]:
         try:
             quotes = normalize_quotes_df(self.provider.quotes())
         except Exception as exc:  # noqa: BLE001
             return self._unavailable(exc)
-        candidates: list[dict[str, Any]] = []
+        if isinstance(recent_codes, str):
+            previous_codes = {normalize_code(item) for item in re.split(r"[,，\\s]+", recent_codes) if normalize_code(item)}
+        elif isinstance(recent_codes, list):
+            previous_codes = {normalize_code(item) for item in recent_codes if normalize_code(item)}
+        else:
+            previous_codes = set()
+        buckets: dict[str, list[dict[str, Any]]] = {
+            "现在可买": [],
+            "等回踩": [],
+            "等突破": [],
+            "只观察": [],
+        }
         rejected: list[dict[str, Any]] = []
         work = quotes[(quotes["latest_price"] > 0) & (quotes["latest_price"] <= price_limit)].copy()
-        work = work.sort_values(by=["day_change_pct", "turnover_rate"], ascending=False).head(limit * 3)
+        work = work[work["code"].map(is_mainboard_code)]
+        work = work[~work["name"].map(is_st_name)]
+        if work.empty:
+            return response_envelope(
+                {"candidates": [], "buy_now": [], "wait_pullback": [], "wait_breakout": [], "watch_only": [], "rejected": []},
+                source=self.source,
+            )
+        change = pd.to_numeric(work["day_change_pct"], errors="coerce").fillna(0.0)
+        turnover_source = work["turnover_rate"] if "turnover_rate" in work else pd.Series(0.0, index=work.index)
+        volume_ratio_source = work["volume_ratio"] if "volume_ratio" in work else pd.Series(0.0, index=work.index)
+        turnover = pd.to_numeric(turnover_source, errors="coerce").fillna(0.0)
+        volume_ratio = pd.to_numeric(volume_ratio_source, errors="coerce").fillna(0.0)
+        work["execution_prefilter_score"] = (
+            change.between(0.0, 5.5).astype(float) * 35
+            + change.between(-2.0, 0.0, inclusive="left").astype(float) * 18
+            - (change >= 7.5).astype(float) * 30
+            + turnover.clip(lower=0, upper=12)
+            + volume_ratio.clip(lower=0, upper=3) * 3
+        )
+        work = work.sort_values(by=["execution_prefilter_score", "turnover_rate"], ascending=False).head(max(limit * 8, 40))
         for _, row in work.iterrows():
             code = str(row["code"])
             name = str(row["name"])
@@ -3442,24 +3709,57 @@ class MarketDataService:
                 continue
             tech = self.technical(code)
             tech_data = tech["data"] if tech["freshness"] != "unavailable" else {}
-            candidates.append(
-                {
-                    "code": code,
-                    "name": name,
-                    "latest_price": float(row["latest_price"]),
-                    "day_change_pct": day_change_pct,
-                    "min_lot_cost": action["min_lot_cost"],
-                    "actionability": action["actionability"],
-                    "technical_score": tech_data.get("technical_score"),
-                    "buy_point": tech_data.get("buy_point"),
-                    "sell_point": tech_data.get("sell_point"),
-                    "stop_loss_point": tech_data.get("stop_loss_point"),
-                    "technical_point_sources": tech_data.get("technical_point_sources"),
-                }
+            latest_price = _nullable_float(row["latest_price"])
+            technical_score = _nullable_float(tech_data.get("technical_score"))
+            buy_point = _nullable_float(tech_data.get("buy_point"))
+            bucket, bucket_reason, distance_pct = self._candidate_execution_bucket(
+                latest_price=latest_price,
+                day_change_pct=day_change_pct,
+                actionability=action["actionability"],
+                technical_score=technical_score,
+                buy_point=buy_point,
             )
-            if len(candidates) >= limit:
+            item = {
+                "code": code,
+                "name": name,
+                "latest_price": latest_price,
+                "day_change_pct": day_change_pct,
+                "min_lot_cost": action["min_lot_cost"],
+                "actionability": action["actionability"],
+                "technical_score": technical_score,
+                "buy_point": buy_point,
+                "buy_point_distance_pct": distance_pct,
+                "sell_point": tech_data.get("sell_point"),
+                "stop_loss_point": tech_data.get("stop_loss_point"),
+                "technical_point_sources": tech_data.get("technical_point_sources"),
+                "execution_bucket": bucket,
+                "execution_reason": bucket_reason,
+                "candidate_source": "broad_mainboard_scan",
+            }
+            if code in previous_codes and bucket == "现在可买":
+                item["duplicate_status"] = "近期已推荐，默认降级观察"
+                item["execution_reason"] = f"{bucket_reason}；但该股近期已经推荐过，本次不作为新的买入推荐"
+                bucket = "只观察"
+                item["execution_bucket"] = bucket
+            if bucket == "剔除":
+                rejected.append({"code": code, "name": name, "reason": bucket_reason})
+            else:
+                buckets[bucket].append(item)
+            if len(buckets["现在可买"]) >= limit:
                 break
-        return response_envelope({"candidates": candidates, "rejected": rejected}, source=self.source)
+        buy_now = buckets["现在可买"][:limit]
+        return response_envelope(
+            {
+                "candidates": buy_now,
+                "buy_now": buy_now,
+                "wait_pullback": buckets["等回踩"][:limit],
+                "wait_breakout": buckets["等突破"][:limit],
+                "watch_only": buckets["只观察"][:limit],
+                "rejected": rejected,
+                "selection_policy": "先扩大主板非ST扫描，再按当下可执行性分层；只有buy_now/candidates才可写成现在可买。",
+            },
+            source=self.source,
+        )
 
     def portfolio_intraday_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
         cash = float(payload.get("cash", 0.0) or 0.0)
@@ -3675,8 +3975,8 @@ def create_app(service: MarketDataService | None = None):
         return service.stock_intraday_analysis(payload)
 
     @app.get("/candidates/actionable")
-    def candidates_actionable(cash: float, price_limit: float = 20.0, limit: int = 20):
-        return service.actionable_candidates(cash=cash, price_limit=price_limit, limit=limit)
+    def candidates_actionable(cash: float, price_limit: float = 20.0, limit: int = 20, recent_codes: str = ""):
+        return service.actionable_candidates(cash=cash, price_limit=price_limit, limit=limit, recent_codes=recent_codes)
 
     @app.post("/candidates/verify")
     def candidates_verify(payload: dict[str, Any]):

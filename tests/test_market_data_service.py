@@ -148,6 +148,78 @@ def test_actionable_candidates_rejects_new_stock_and_overheated_gain() -> None:
     assert rejected["000001"] == "涨幅过高不追"
 
 
+def test_actionable_candidates_prioritizes_buy_now_over_hot_or_far_buy_points() -> None:
+    def hist_with_ma20(last_close: float, ma20_level: float) -> pd.DataFrame:
+        closes = [ma20_level for _ in range(39)] + [last_close]
+        return pd.DataFrame(
+            {
+                "收盘": closes,
+                "最高": [value * 1.02 for value in closes],
+                "最低": [value * 0.98 for value in closes],
+                "成交量": [100000 + i * 1000 for i in range(len(closes))],
+            }
+        )
+
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "000001", "名称": "平安银行", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.2},
+                {"代码": "000002", "名称": "万科A", "最新价": 8.0, "涨跌幅": 8.8, "换手率": 7.0, "量比": 1.8},
+                {"代码": "000063", "名称": "中兴通讯", "最新价": 30.0, "涨跌幅": 1.5, "换手率": 3.0, "量比": 1.1},
+            ]
+        ),
+        bidasks={
+            "000001": pd.DataFrame([{"item": "最新", "value": 10.0}, {"item": "涨幅", "value": 2.0}, {"item": "sell_1", "value": 10.01}, {"item": "buy_1", "value": 10.0}]),
+            "000002": pd.DataFrame([{"item": "最新", "value": 8.0}, {"item": "涨幅", "value": 8.8}, {"item": "sell_1", "value": 8.01}, {"item": "buy_1", "value": 8.0}]),
+            "000063": pd.DataFrame([{"item": "最新", "value": 30.0}, {"item": "涨幅", "value": 1.5}, {"item": "sell_1", "value": 30.01}, {"item": "buy_1", "value": 30.0}]),
+        },
+        hist={
+            "000001": hist_with_ma20(last_close=10.0, ma20_level=9.9),
+            "000002": hist_with_ma20(last_close=8.0, ma20_level=7.9),
+            "000063": hist_with_ma20(last_close=30.0, ma20_level=34.0),
+        },
+    )
+
+    out = MarketDataService(provider=provider).actionable_candidates(cash=4000.0, price_limit=50.0, limit=5)
+
+    assert [item["code"] for item in out["data"]["buy_now"]] == ["000001"]
+    assert out["data"]["buy_now"][0]["execution_bucket"] == "现在可买"
+    assert out["data"]["buy_now"][0]["buy_point_distance_pct"] <= 3.0
+    assert {item["code"] for item in out["data"]["watch_only"]} == {"000002"}
+    assert {item["code"] for item in out["data"]["wait_breakout"]} == {"000063"}
+    assert [item["code"] for item in out["data"]["candidates"]] == ["000001"]
+
+
+def test_actionable_candidates_moves_recent_recommendations_to_watch_only() -> None:
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "000001", "名称": "平安银行", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.2}]),
+        bidasks={
+            "000001": pd.DataFrame([{"item": "最新", "value": 10.0}, {"item": "涨幅", "value": 2.0}, {"item": "sell_1", "value": 10.01}, {"item": "buy_1", "value": 10.0}]),
+        },
+        hist={
+            "000001": pd.DataFrame(
+                {
+                    "收盘": [9.9 for _ in range(39)] + [10.0],
+                    "最高": [10.2 for _ in range(40)],
+                    "最低": [9.7 for _ in range(40)],
+                    "成交量": [100000 + i * 1000 for i in range(40)],
+                }
+            )
+        },
+    )
+
+    out = MarketDataService(provider=provider).actionable_candidates(
+        cash=4000.0,
+        price_limit=20.0,
+        limit=5,
+        recent_codes="000001",
+    )
+
+    assert out["data"]["buy_now"] == []
+    assert out["data"]["watch_only"][0]["code"] == "000001"
+    assert out["data"]["watch_only"][0]["duplicate_status"] == "近期已推荐，默认降级观察"
+
+
 def test_verify_candidates_scores_chatgpt_candidates_without_full_market_scan() -> None:
     class CandidateProvider(StaticMarketDataProvider):
         def quotes(self) -> pd.DataFrame:
@@ -461,6 +533,86 @@ def test_stock_intraday_analysis_aggressive_score_penalizes_weak_data_quality() 
     assert "分时缺失" in out["technical_interpretation"]["risk_tags"]
     assert out["response_completeness_check"]["coverage"]["intraday_vwap"] is False
     assert "分时均价缺失" in out["response_completeness_check"]["missing_or_degraded_items"]
+
+
+def test_stock_intraday_analysis_returns_professional_diagnosis_sections() -> None:
+    hist_df = pd.DataFrame(
+        {
+            "日期": [f"2026-06-{day:02d}" for day in range(1, 31)] + [f"2026-07-{day:02d}" for day in range(1, 31)],
+            "开盘": [7.0 + i * 0.03 for i in range(60)],
+            "最高": [7.2 + i * 0.03 for i in range(60)],
+            "最低": [6.8 + i * 0.03 for i in range(60)],
+            "收盘": [7.0 + i * 0.03 for i in range(60)],
+            "成交量": [100000 + i * 2000 for i in range(60)],
+        }
+    )
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {
+                    "代码": "002100",
+                    "名称": "天康生物",
+                    "最新价": 8.76,
+                    "涨跌幅": 1.8,
+                    "今开": 8.6,
+                    "最高": 8.9,
+                    "最低": 8.55,
+                    "换手率": 4.5,
+                    "量比": 1.4,
+                    "总市值": 12000000000,
+                    "流通市值": 9000000000,
+                }
+            ]
+        ),
+        indices=pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}]),
+        boards_df=pd.DataFrame(
+            [
+                {
+                    "board_type": "行业",
+                    "board_name": "农牧饲渔",
+                    "change_pct": 2.8,
+                    "up_ratio": 0.72,
+                    "leader_code": "002100",
+                    "leader": "天康生物",
+                    "leader_change_pct": 1.8,
+                    "board_action": "可参与",
+                }
+            ]
+        ),
+        bidasks={
+            "002100": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 8.76},
+                    {"item": "涨幅", "value": 1.8},
+                    {"item": "buy_1", "value": 8.76},
+                    {"item": "buy_1_vol", "value": 12000},
+                    {"item": "sell_1", "value": 8.77},
+                    {"item": "sell_1_vol", "value": 9000},
+                ]
+            )
+        },
+        hist={"002100": hist_df},
+        intraday={
+            "002100": pd.DataFrame(
+                [
+                    {"time": "09:31", "close": 8.6, "avg_price": 8.58, "volume": 10000, "amount": 86000},
+                    {"time": "10:00", "close": 8.76, "avg_price": 8.68, "volume": 18000, "amount": 157680},
+                ]
+            )
+        },
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis(
+        {"code": "002100", "account": {"cash": 5000, "positions": [{"code": "002100", "shares": 100, "available": 100, "cost": 8.5}]}}
+    )
+
+    assert out["trade_setup_type"]["type"] in {"趋势回踩", "放量突破", "弱转强修复", "趋势持有"}
+    assert out["professional_technical_diagnosis"]["level_source_policy"] == "区间优先，单点必须有来源"
+    assert out["professional_technical_diagnosis"]["key_evidence"]
+    assert out["fundamental_diagnosis"]["status"] in {"partial", "ok"}
+    assert "基本面" in out["fundamental_diagnosis"]["usage_note"]
+    assert out["sector_alignment"]["status"] in {"强于板块", "同步板块", "弱于板块", "不可确认"}
+    assert set(out["professional_scenario_plan"]) == {"upside", "base", "downside"}
 
 
 def test_verify_candidates_marks_repeated_names_as_tracking_not_new_recommendations() -> None:
