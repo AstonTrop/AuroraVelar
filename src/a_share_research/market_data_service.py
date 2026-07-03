@@ -3747,6 +3747,250 @@ class MarketDataService:
             "usage_note": "buy_now只代表可执行；trade_quality_tier才决定是否可写成强推荐、小仓试错或条件观察。",
         }
 
+    def _candidate_market_gate(self) -> dict[str, Any]:
+        try:
+            snapshot = self.market_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "unknown",
+                "freshness": "unavailable",
+                "risk_mode": "unknown",
+                "up_count": None,
+                "down_count": None,
+                "reason": f"市场数据不可确认: {type(exc).__name__}",
+            }
+        freshness = snapshot.get("freshness")
+        data = snapshot.get("data") if isinstance(snapshot.get("data"), dict) else {}
+        risk_mode = str(data.get("risk_mode") or data.get("market_condition") or "unknown").lower()
+        breadth = data.get("breadth") if isinstance(data.get("breadth"), dict) else {}
+        up_count = _nullable_float(breadth.get("up_count"))
+        down_count = _nullable_float(breadth.get("down_count"))
+        status = "unknown"
+        reason = "市场数据不可确认"
+        if freshness in {"live", "partial_live", "delayed", "after_close"}:
+            if risk_mode in {"attack", "strong", "强势"}:
+                status = "pass"
+                reason = "市场状态允许进攻"
+            elif risk_mode in {"defense", "weak", "弱势", "极弱"}:
+                status = "weak_pass"
+                reason = "市场偏弱，只允许小仓或观察"
+            elif up_count is not None and down_count is not None and up_count > down_count:
+                status = "pass"
+                reason = "上涨家数多于下跌家数，市场允许试错"
+            else:
+                status = "weak_pass"
+                reason = "市场方向不够明确，只允许试错"
+        return {
+            "status": status,
+            "freshness": freshness,
+            "risk_mode": risk_mode,
+            "up_count": up_count,
+            "down_count": down_count,
+            "reason": reason,
+        }
+
+    def _candidate_sector_gate(self, *, row: pd.Series, boards: dict[str, Any]) -> dict[str, Any]:
+        name = str(row.get("name") or row.get("名称") or "")
+        industry = str(row.get("industry") or row.get("行业") or "")
+        board_rows = boards.get("boards") if isinstance(boards.get("boards"), list) else []
+        if not board_rows:
+            return {
+                "status": "unknown",
+                "industry": industry or None,
+                "concepts": [],
+                "board_rank": None,
+                "board_change_pct": None,
+                "board_up_ratio": None,
+                "leader_strength": "unknown",
+                "stock_vs_board": "unknown",
+                "reason": "板块数据不可确认",
+            }
+        matched: tuple[int, dict[str, Any]] | None = None
+        for index, board in enumerate(board_rows, start=1):
+            board_name = str(board.get("name") or board.get("板块") or "")
+            if industry and board_name and (industry in board_name or board_name in industry):
+                matched = (index, board)
+                break
+            leader_name = str(board.get("leader_name") or board.get("领涨股") or "")
+            if leader_name and (leader_name in name or name in leader_name):
+                matched = (index, board)
+                break
+        if matched is None:
+            return {
+                "status": "unknown",
+                "industry": industry or None,
+                "concepts": [],
+                "board_rank": None,
+                "board_change_pct": None,
+                "board_up_ratio": None,
+                "leader_strength": "unknown",
+                "stock_vs_board": "unknown",
+                "reason": "未匹配到所属强弱板块",
+            }
+        rank, board = matched
+        board_change = _nullable_float(board.get("change_pct") or board.get("涨跌幅"))
+        board_up_ratio = _nullable_float(board.get("up_ratio") or board.get("上涨比例"))
+        stock_change = _nullable_float(row.get("day_change_pct") or row.get("涨跌幅"))
+        leader_change = _nullable_float(board.get("leader_change_pct") or board.get("领涨股涨跌幅"))
+        stock_vs_board = "unknown"
+        if stock_change is not None and board_change is not None:
+            if stock_change >= board_change + 1:
+                stock_vs_board = "stronger"
+            elif stock_change < board_change - 2:
+                stock_vs_board = "weaker"
+            else:
+                stock_vs_board = "in_line"
+        leader_strength = "unknown"
+        if leader_change is not None:
+            leader_strength = "strong" if leader_change >= 5 else "mixed" if leader_change >= 2 else "weak"
+        status = "unknown"
+        reason = "板块强弱需要继续确认"
+        if board_change is not None and board_change >= 2 and stock_vs_board in {"stronger", "in_line"}:
+            status = "pass"
+            reason = "板块强且个股没有掉队"
+        elif board_change is not None and board_change >= 1 and stock_vs_board == "stronger":
+            status = "weak_pass"
+            reason = "板块一般但个股强于板块"
+        elif stock_vs_board == "weaker":
+            status = "fail"
+            reason = "个股弱于所属板块"
+        return {
+            "status": status,
+            "industry": industry or board.get("name"),
+            "concepts": [],
+            "board_rank": rank,
+            "board_change_pct": board_change,
+            "board_up_ratio": board_up_ratio,
+            "leader_strength": leader_strength,
+            "stock_vs_board": stock_vs_board,
+            "reason": reason,
+        }
+
+    def _candidate_stock_role(self, *, row: pd.Series, sector_gate: dict[str, Any]) -> str:
+        change_pct = _nullable_float(row.get("day_change_pct") or row.get("涨跌幅"))
+        turnover = _nullable_float(row.get("turnover_rate") or row.get("换手率"))
+        volume_ratio = _nullable_float(row.get("volume_ratio") or row.get("量比"))
+        if sector_gate.get("status") == "unknown":
+            return "unknown"
+        if change_pct is not None and change_pct >= 5 and sector_gate.get("stock_vs_board") in {"stronger", "in_line"}:
+            return "leader"
+        if turnover is not None and turnover >= 3 and volume_ratio is not None and volume_ratio >= 1:
+            return "trend_core"
+        if change_pct is not None and 0 <= change_pct <= 3 and sector_gate.get("status") in {"pass", "weak_pass"}:
+            return "low_position_repair"
+        if change_pct is not None and -1 <= change_pct <= 2 and sector_gate.get("stock_vs_board") == "stronger":
+            return "turnaround"
+        return "follower"
+
+    def _candidate_entry_setup(self, *, latest_price: float | None, buy_point: float | None, intraday: dict[str, Any]) -> dict[str, Any]:
+        rows = intraday.get("rows") if isinstance(intraday.get("rows"), list) else []
+        last = rows[-1] if rows else {}
+        avg_price = _nullable_float(last.get("avg_price") or last.get("vwap"))
+        close = _nullable_float(last.get("close") or last.get("price")) or latest_price
+        setup = "not_triggered"
+        reason = "分时数据不足，买点未确认"
+        if close is not None and avg_price is not None:
+            if close >= avg_price and latest_price is not None and buy_point is not None and abs(latest_price - buy_point) / latest_price <= 0.015:
+                setup = "vwap_pullback_hold"
+                reason = "现价在买点附近且站在分时均价上方"
+            elif close >= avg_price:
+                setup = "vwap_reclaim"
+                reason = "价格站回分时均价"
+            else:
+                reason = "价格仍低于分时均价"
+        return {"type": setup, "avg_price": avg_price, "last_price": close, "reason": reason}
+
+    def _candidate_intraday_data(self, code: str) -> dict[str, Any]:
+        test_intraday = getattr(self, "intraday_1m", None)
+        if callable(test_intraday):
+            try:
+                result = test_intraday(code, limit=30)
+                if isinstance(result, dict):
+                    return result.get("data") if isinstance(result.get("data"), dict) else result
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            return self._intraday_rows(code, limit=30)
+        except Exception:  # noqa: BLE001
+            return {"status": "failed", "rows": []}
+
+    def _candidate_account_gate(self, *, cash: float, min_lot_cost: float | None, latest_price: float | None) -> dict[str, Any]:
+        can_buy = min_lot_cost is not None and min_lot_cost <= cash
+        cash_after = round(cash - min_lot_cost, 2) if can_buy and min_lot_cost is not None else None
+        decision = "pass" if can_buy else "fail"
+        reason = "现金可以买一手" if can_buy else "现金不足买一手"
+        return {
+            "can_buy_lot": can_buy,
+            "min_lot_cost": min_lot_cost,
+            "cash_after_buy": cash_after,
+            "stock_position_after_buy_pct": None,
+            "same_sector_exposure_after_buy_pct": None,
+            "t_plus_1_risk": "medium" if can_buy else "high",
+            "decision": decision,
+            "reason": reason,
+        }
+
+    def _candidate_opportunity_source(self, *, sector_gate: dict[str, Any], stock_role: str, entry_setup: str, duplicate: bool) -> str:
+        if duplicate:
+            return "cooldown_watch"
+        if stock_role in {"leader", "trend_core"} and sector_gate.get("status") == "pass":
+            return "mainline_core"
+        if entry_setup == "vwap_pullback_hold":
+            return "pullback_repair"
+        if entry_setup == "vwap_reclaim":
+            return "turnaround"
+        return "conditional_watch"
+
+    def _candidate_recommendation_tier(
+        self,
+        *,
+        market_gate: dict[str, Any],
+        sector_gate: dict[str, Any],
+        stock_role: str,
+        entry_setup: str,
+        account_gate: dict[str, Any],
+        trade_quality_tier: str,
+        duplicate: bool,
+    ) -> tuple[str, list[str], list[str]]:
+        reasons: list[str] = []
+        downgrades: list[str] = []
+        if market_gate.get("status") == "unknown":
+            downgrades.append("市场数据不可确认")
+        if sector_gate.get("status") == "unknown":
+            downgrades.append("板块数据不可确认")
+        if sector_gate.get("status") == "fail":
+            downgrades.append("板块门槛失败")
+        if stock_role in {"follower", "unknown"}:
+            downgrades.append("个股角色不是核心")
+        if entry_setup == "not_triggered":
+            downgrades.append("买点未触发")
+        if account_gate.get("decision") == "fail":
+            downgrades.append(str(account_gate.get("reason") or "账户门槛失败"))
+        if duplicate:
+            downgrades.append("近期已推荐且没有新证据")
+        if trade_quality_tier == "强推荐可买":
+            reasons.append("基础技术质量达强推荐门槛")
+        if sector_gate.get("status") == "pass":
+            reasons.append("板块门槛通过")
+        if entry_setup != "not_triggered":
+            reasons.append("买点正在发生")
+        if account_gate.get("decision") == "pass":
+            reasons.append("账户可以买一手")
+
+        if not downgrades and trade_quality_tier == "强推荐可买" and market_gate.get("status") == "pass":
+            return "强推荐可买", reasons, downgrades
+        if (
+            account_gate.get("decision") == "pass"
+            and sector_gate.get("status") in {"pass", "weak_pass"}
+            and entry_setup != "not_triggered"
+            and stock_role not in {"follower", "unknown"}
+            and not duplicate
+        ):
+            return "小仓试错", reasons, downgrades
+        if account_gate.get("decision") == "fail" or sector_gate.get("status") == "fail":
+            return "剔除", reasons, downgrades
+        return "条件观察", reasons, downgrades
+
     def actionable_candidates(
         self,
         cash: float,
@@ -3771,12 +4015,29 @@ class MarketDataService:
             "只观察": [],
         }
         rejected: list[dict[str, Any]] = []
+        market_gate = self._candidate_market_gate()
+        try:
+            boards_result = self.hot_boards(limit=20)
+            boards_data = boards_result.get("data") if boards_result.get("freshness") != "unavailable" and isinstance(boards_result.get("data"), dict) else {}
+        except Exception:  # noqa: BLE001
+            boards_data = {}
+        opportunity_pools: dict[str, list[dict[str, Any]]] = {
+            "mainline_core": [],
+            "pullback_repair": [],
+            "turnaround": [],
+            "sold_reclaim": [],
+            "cooldown_watch": [],
+            "conditional_watch": [],
+        }
         work = quotes[(quotes["latest_price"] > 0) & (quotes["latest_price"] <= price_limit)].copy()
         work = work[work["code"].map(is_mainboard_code)]
         work = work[~work["name"].map(is_st_name)]
         if work.empty:
             return response_envelope(
                 {
+                    "market_gate": market_gate,
+                    "sector_candidates": [],
+                    "opportunity_pools": opportunity_pools,
                     "candidates": [],
                     "buy_now": [],
                     "strong_buy": [],
@@ -3867,25 +4128,73 @@ class MarketDataService:
                     execution_bucket=bucket,
                 )
             )
+            intraday_data = self._candidate_intraday_data(code)
+            sector_gate = self._candidate_sector_gate(row=row, boards=boards_data)
+            stock_role = self._candidate_stock_role(row=row, sector_gate=sector_gate)
+            entry = self._candidate_entry_setup(latest_price=latest_price, buy_point=buy_point, intraday=intraday_data)
+            account_gate = self._candidate_account_gate(cash=cash, min_lot_cost=action.get("min_lot_cost"), latest_price=latest_price)
+            duplicate = code in previous_codes
+            opportunity_source = self._candidate_opportunity_source(
+                sector_gate=sector_gate,
+                stock_role=stock_role,
+                entry_setup=entry["type"],
+                duplicate=duplicate,
+            )
+            recommendation_tier, recommendation_reasons, v45_downgrades = self._candidate_recommendation_tier(
+                market_gate=market_gate,
+                sector_gate=sector_gate,
+                stock_role=stock_role,
+                entry_setup=entry["type"],
+                account_gate=account_gate,
+                trade_quality_tier=str(item.get("trade_quality_tier") or ""),
+                duplicate=duplicate,
+            )
+            item.update(
+                {
+                    "market_gate": market_gate,
+                    "sector_gate": sector_gate,
+                    "stock_role": stock_role,
+                    "entry_setup": entry["type"],
+                    "entry_setup_detail": entry,
+                    "account_gate": account_gate,
+                    "opportunity_source": opportunity_source,
+                    "recommendation_tier": recommendation_tier,
+                    "recommendation_reasons": recommendation_reasons,
+                    "downgrade_reasons": list(dict.fromkeys([*item.get("downgrade_reasons", []), *v45_downgrades])),
+                    "anti_repeat_status": "近期已推荐，冷却观察" if duplicate else "新候选或有待验证候选",
+                    "new_evidence": recommendation_reasons if duplicate and recommendation_tier != "条件观察" else [],
+                }
+            )
             if code in previous_codes and bucket == "现在可买":
                 item["duplicate_status"] = "近期已推荐，默认降级观察"
                 item["execution_reason"] = f"{bucket_reason}；但该股近期已经推荐过，本次不作为新的买入推荐"
                 bucket = "只观察"
                 item["execution_bucket"] = bucket
                 item["trade_quality_tier"] = "条件观察"
+                item["opportunity_source"] = "cooldown_watch"
+                item["recommendation_tier"] = "条件观察"
+                item["anti_repeat_status"] = "近期已推荐，冷却观察"
                 item["downgrade_reasons"] = list(dict.fromkeys([*item.get("downgrade_reasons", []), "近期已推荐"]))
             if bucket == "剔除":
                 rejected.append({"code": code, "name": name, "reason": bucket_reason})
             else:
+                opportunity_pools.setdefault(str(item.get("opportunity_source") or "conditional_watch"), []).append(item)
                 buckets[bucket].append(item)
             if len(buckets["现在可买"]) >= limit:
                 break
         buy_now = buckets["现在可买"][:limit]
-        strong_buy = [item for item in buy_now if item.get("trade_quality_tier") == "强推荐可买"]
-        trial_buy = [item for item in buy_now if item.get("trade_quality_tier") == "小仓试错"]
-        conditional_buy = [item for item in buy_now if item.get("trade_quality_tier") == "条件观察"]
+        strong_buy = [item for item in buy_now if item.get("recommendation_tier") == "强推荐可买"]
+        trial_buy = [item for item in buy_now if item.get("recommendation_tier") == "小仓试错"]
+        conditional_buy = [
+            item
+            for item in [*buy_now, *buckets["等回踩"], *buckets["等突破"], *buckets["只观察"]]
+            if item.get("recommendation_tier") == "条件观察"
+        ][:limit]
         return response_envelope(
             {
+                "market_gate": market_gate,
+                "sector_candidates": boards_data.get("boards", [])[:10] if isinstance(boards_data.get("boards"), list) else [],
+                "opportunity_pools": {key: value[:limit] for key, value in opportunity_pools.items()},
                 "candidates": buy_now,
                 "buy_now": buy_now,
                 "strong_buy": strong_buy,
@@ -3895,7 +4204,7 @@ class MarketDataService:
                 "wait_breakout": buckets["等突破"][:limit],
                 "watch_only": buckets["只观察"][:limit],
                 "rejected": rejected,
-                "selection_policy": "先扩大主板非ST扫描，再按当下可执行性分层；buy_now只代表可执行，strong_buy才可写成强推荐，trial_buy只能小仓试错，conditional_buy只能条件观察。",
+                "selection_policy": "V4.5机会漏斗：先看市场和板块，再看个股角色、分时买点、风险收益比、账户约束和重复冷却；buy_now仍只代表可执行，recommendation_tier才决定是否推荐。",
             },
             source=self.source,
         )

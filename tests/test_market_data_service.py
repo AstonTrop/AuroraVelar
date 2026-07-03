@@ -248,13 +248,166 @@ def test_actionable_candidates_separates_strong_buy_from_loose_buy_now() -> None
     data = out["data"]
     by_code = {item["code"]: item for item in data["buy_now"]}
 
-    assert [item["code"] for item in data["strong_buy"]] == ["000001"]
+    assert data["strong_buy"] == []
     assert by_code["000001"]["trade_quality_tier"] == "强推荐可买"
+    assert by_code["000001"]["recommendation_tier"] == "条件观察"
+    assert "板块数据不可确认" in by_code["000001"]["downgrade_reasons"]
     assert by_code["000001"]["risk_reward_ratio"] >= 1.5
     assert by_code["000002"]["trade_quality_tier"] in {"条件观察", "小仓试错"}
     assert "止损空间过大" in by_code["000002"]["downgrade_reasons"] or "风险收益比不足" in by_code["000002"]["downgrade_reasons"]
     assert by_code["603926"]["trade_quality_tier"] != "强推荐可买"
     assert "XD/除权股默认降级" in by_code["603926"]["downgrade_reasons"]
+
+
+def test_v45_strong_candidate_requires_sector_role_entry_and_account_gate() -> None:
+    class V45Service(MarketDataService):
+        def market_snapshot(self) -> dict:
+            return {"freshness": "live", "data": {"risk_mode": "attack", "breadth": {"up_count": 3600, "down_count": 1400}}}
+
+        def hot_boards(self, limit: int = 20) -> dict:
+            return {
+                "freshness": "live",
+                "data": {
+                    "boards": [
+                        {"name": "汽车零部件", "change_pct": 3.5, "rank": 3, "up_ratio": 0.72, "leader_name": "强结构A", "leader_change_pct": 5.2}
+                    ]
+                },
+            }
+
+        def technical(self, code: str, report_date: date | None = None) -> dict:
+            return {
+                "freshness": "live",
+                "data": {
+                    "code": code,
+                    "technical_score": 72.0,
+                    "buy_point": 9.95,
+                    "sell_point": 10.9,
+                    "stop_loss_point": 9.7,
+                    "technical_point_sources": "测试买点来自MA20回踩确认",
+                },
+            }
+
+        def intraday_1m(self, code: str, limit: int = 0) -> dict:
+            return {
+                "freshness": "live",
+                "data": {
+                    "rows": [
+                        {"time": "10:28", "close": 9.96, "avg_price": 9.94, "volume": 100000},
+                        {"time": "10:29", "close": 10.00, "avg_price": 9.95, "volume": 140000},
+                    ]
+                },
+            }
+
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "000001", "名称": "强结构A", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.3, "行业": "汽车零部件"},
+            ]
+        ),
+        bidasks={
+            "000001": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 10.0},
+                    {"item": "涨幅", "value": 2.0},
+                    {"item": "sell_1", "value": 10.01},
+                    {"item": "buy_1", "value": 10.0},
+                ]
+            )
+        },
+    )
+
+    out = V45Service(provider=provider).actionable_candidates(cash=6000.0, price_limit=30.0, limit=5)
+    data = out["data"]
+    item = data["strong_buy"][0]
+
+    assert item["code"] == "000001"
+    assert item["recommendation_tier"] == "强推荐可买"
+    assert item["sector_gate"]["status"] == "pass"
+    assert item["stock_role"] in {"leader", "trend_core", "low_position_repair", "turnaround"}
+    assert item["entry_setup"] in {"vwap_reclaim", "vwap_pullback_hold", "trend_continuation", "breakout_confirmed"}
+    assert item["account_gate"]["decision"] == "pass"
+    assert data["opportunity_pools"]["mainline_core"][0]["code"] == "000001"
+
+
+def test_v45_missing_sector_data_downgrades_candidate_to_conditional() -> None:
+    class MissingSectorService(MarketDataService):
+        def market_snapshot(self) -> dict:
+            return {"freshness": "live", "data": {"risk_mode": "attack"}}
+
+        def hot_boards(self, limit: int = 20) -> dict:
+            return {"freshness": "unavailable", "data": {"error": "board unavailable"}}
+
+        def technical(self, code: str, report_date: date | None = None) -> dict:
+            return {"freshness": "live", "data": {"technical_score": 75.0, "buy_point": 9.95, "sell_point": 10.9, "stop_loss_point": 9.7}}
+
+        def intraday_1m(self, code: str, limit: int = 0) -> dict:
+            return {"freshness": "live", "data": {"rows": [{"time": "10:29", "close": 10.0, "avg_price": 9.95, "volume": 100000}]}}
+
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "000001", "名称": "强结构A", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.3}]),
+        bidasks={"000001": pd.DataFrame([{"item": "最新", "value": 10.0}, {"item": "涨幅", "value": 2.0}, {"item": "sell_1", "value": 10.01}, {"item": "buy_1", "value": 10.0}])},
+    )
+
+    out = MissingSectorService(provider=provider).actionable_candidates(cash=6000.0, price_limit=30.0, limit=5)
+    data = out["data"]
+
+    assert data["strong_buy"] == []
+    assert data["conditional_buy"][0]["code"] == "000001"
+    assert data["conditional_buy"][0]["sector_gate"]["status"] == "unknown"
+    assert "板块数据不可确认" in data["conditional_buy"][0]["downgrade_reasons"]
+
+
+def test_v45_recent_candidate_goes_to_cooldown_watch_even_if_technically_buyable() -> None:
+    class RepeatService(MarketDataService):
+        def market_snapshot(self) -> dict:
+            return {"freshness": "live", "data": {"risk_mode": "attack"}}
+
+        def hot_boards(self, limit: int = 20) -> dict:
+            return {"freshness": "live", "data": {"boards": [{"name": "汽车零部件", "change_pct": 3.5, "rank": 2, "up_ratio": 0.7}]}}
+
+        def technical(self, code: str, report_date: date | None = None) -> dict:
+            return {"freshness": "live", "data": {"technical_score": 72.0, "buy_point": 9.95, "sell_point": 10.9, "stop_loss_point": 9.7}}
+
+        def intraday_1m(self, code: str, limit: int = 0) -> dict:
+            return {"freshness": "live", "data": {"rows": [{"time": "10:29", "close": 10.0, "avg_price": 9.95, "volume": 100000}]}}
+
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "000001", "名称": "强结构A", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.3, "行业": "汽车零部件"}]),
+        bidasks={"000001": pd.DataFrame([{"item": "最新", "value": 10.0}, {"item": "涨幅", "value": 2.0}, {"item": "sell_1", "value": 10.01}, {"item": "buy_1", "value": 10.0}])},
+    )
+
+    out = RepeatService(provider=provider).actionable_candidates(cash=6000.0, price_limit=30.0, limit=5, recent_codes="000001")
+
+    assert out["data"]["strong_buy"] == []
+    assert out["data"]["opportunity_pools"]["cooldown_watch"][0]["code"] == "000001"
+    assert out["data"]["opportunity_pools"]["cooldown_watch"][0]["recommendation_tier"] == "条件观察"
+
+
+def test_v45_candidate_below_intraday_average_cannot_be_strong_buy() -> None:
+    class BelowVwapService(MarketDataService):
+        def market_snapshot(self) -> dict:
+            return {"freshness": "live", "data": {"risk_mode": "attack"}}
+
+        def hot_boards(self, limit: int = 20) -> dict:
+            return {"freshness": "live", "data": {"boards": [{"name": "汽车零部件", "change_pct": 3.5, "rank": 2, "up_ratio": 0.7}]}}
+
+        def technical(self, code: str, report_date: date | None = None) -> dict:
+            return {"freshness": "live", "data": {"technical_score": 72.0, "buy_point": 9.95, "sell_point": 10.9, "stop_loss_point": 9.7}}
+
+        def intraday_1m(self, code: str, limit: int = 0) -> dict:
+            return {"freshness": "live", "data": {"rows": [{"time": "10:29", "close": 9.9, "avg_price": 10.05, "volume": 100000}]}}
+
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "000001", "名称": "强结构A", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.3, "行业": "汽车零部件"}]),
+        bidasks={"000001": pd.DataFrame([{"item": "最新", "value": 10.0}, {"item": "涨幅", "value": 2.0}, {"item": "sell_1", "value": 10.01}, {"item": "buy_1", "value": 10.0}])},
+    )
+
+    out = BelowVwapService(provider=provider).actionable_candidates(cash=6000.0, price_limit=30.0, limit=5)
+    item = out["data"]["conditional_buy"][0]
+
+    assert out["data"]["strong_buy"] == []
+    assert item["entry_setup"] == "not_triggered"
+    assert "买点未触发" in item["downgrade_reasons"]
 
 
 def test_verify_candidates_scores_chatgpt_candidates_without_full_market_scan() -> None:
