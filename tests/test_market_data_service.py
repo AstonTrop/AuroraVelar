@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-import time
 
 import pandas as pd
 
@@ -1055,66 +1054,6 @@ def test_portfolio_intraday_decision_fast_mode_skips_slow_recent_trades() -> Non
     assert len(out["data"]["positions"]) == 2
     assert out["data"]["positions"][0]["recent_trades_status"] == "skipped"
     assert "一次调用" in out["data"]["speed_note"]
-
-
-def test_portfolio_intraday_decision_hard_timeout_returns_partial_result() -> None:
-    class SlowHistoryProvider(StaticMarketDataProvider):
-        def hist(self, code: str, report_date: date | None = None) -> pd.DataFrame:
-            time.sleep(0.25)
-            return super().hist(code, report_date=report_date)
-
-    provider = SlowHistoryProvider(
-        quotes=pd.DataFrame([{"代码": "000725", "名称": "京东方A", "最新价": 9.1, "涨跌幅": 1.2}]),
-        indices=pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}]),
-        boards_df=pd.DataFrame([{"board_type": "行业", "board_name": "电子元件", "leader_code": "000725", "leader": "京东方A"}]),
-        bidasks={"000725": pd.DataFrame([{"item": "最新", "value": 9.1}, {"item": "buy_1", "value": 9.1}, {"item": "sell_1", "value": 9.11}])},
-        intraday={"000725": pd.DataFrame([{"time": "10:00", "close": 9.1, "avg_price": 9.05, "volume": 10000, "amount": 91000}])},
-    )
-
-    started = time.perf_counter()
-    out = MarketDataService(provider=provider).portfolio_intraday_decision(
-        {
-            "cash": 3000,
-            "mode": "fast",
-            "timeout_seconds": 0.05,
-            "module_timeout_seconds": 2,
-            "positions": [{"code": "000725", "name": "京东方A", "shares": 100, "available": 100, "cost": 8.6}],
-        }
-    )
-    elapsed = time.perf_counter() - started
-
-    assert elapsed < 0.2
-    assert out["freshness"] == "partial_live"
-    assert out["data"]["positions"][0]["suggested_action"] == "数据超时，先不做交易结论"
-    assert out["data"]["positions"][0]["technical_status"] == "failed"
-
-
-def test_stock_intraday_analysis_can_skip_slow_board_constituent_mapping() -> None:
-    class SlowBoardConstituentProvider(StaticMarketDataProvider):
-        def board_constituents(self, board: dict[str, object]) -> pd.DataFrame:
-            raise AssertionError("fast stock analysis should skip slow board constituent mapping")
-
-    hist_df = pd.DataFrame({"收盘": [8.0 + i * 0.01 for i in range(60)], "最高": [8.1 + i * 0.01 for i in range(60)], "最低": [7.9 + i * 0.01 for i in range(60)], "成交量": [100000 + i for i in range(60)]})
-    provider = SlowBoardConstituentProvider(
-        quotes=pd.DataFrame([{"代码": "000725", "名称": "京东方A", "最新价": 9.1, "涨跌幅": 1.2}]),
-        indices=pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}]),
-        boards_df=pd.DataFrame([{"board_type": "行业", "board_name": "电子元件", "leader_code": "600000", "leader": "非持仓股"}]),
-        bidasks={"000725": pd.DataFrame([{"item": "最新", "value": 9.1}, {"item": "buy_1", "value": 9.1}, {"item": "sell_1", "value": 9.11}])},
-        hist={"000725": hist_df},
-        intraday={"000725": pd.DataFrame([{"time": "10:00", "close": 9.1, "avg_price": 9.05, "volume": 10000, "amount": 91000}])},
-    )
-
-    out = MarketDataService(provider=provider).stock_intraday_analysis(
-        {
-            "code": "000725",
-            "include_board_constituents": False,
-            "include_recent_trades": False,
-            "include_zt_pool": False,
-        }
-    )
-
-    assert out["data_quality"]["board_status"] == "partial"
-    assert "skipped" in out["board"]["error"]
 
 
 def test_openapi_marks_read_only_actions_as_non_consequential() -> None:

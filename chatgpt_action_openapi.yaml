@@ -112,13 +112,6 @@ paths:
                   type: boolean
                   description: 是否抓涨停池关联；竞价或盘中快速分析可设为false以减少等待
                   default: true
-                include_board_constituents:
-                  type: boolean
-                  description: 是否通过板块成分股慢查询精确映射所属板块；盘中快速分析建议false，深度核验可设为true
-                  default: true
-                module_timeout_seconds:
-                  type: number
-                  description: 单个数据模块硬超时秒数；盘中快速分析建议4，深度分析建议8；超时模块会返回failed而不是拖慢整次回复
                 account:
                   type: object
                   description: 用户账户约束，可由截图或手工输入转换而来
@@ -280,12 +273,6 @@ paths:
                 max_workers:
                   type: integer
                   description: 后端并行抓取持仓数量，默认最多4
-                timeout_seconds:
-                  type: number
-                  description: 整个组合分析硬超时秒数；fast默认25，deep默认55；到点返回已完成结果和超时标记
-                module_timeout_seconds:
-                  type: number
-                  description: 单只股票内每个数据模块的硬超时秒数；fast默认4，deep默认8
                 positions:
                   type: array
                   items:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,6 @@ EASTMONEY_DIRECT_SOURCE = "eastmoney/direct"
 SINA_SOURCE = "sina/market-center"
 TENCENT_SOURCE = "tencent/qt"
 MIN_FULL_MARKET_ROWS = 1000
-DEFAULT_HTTP_TIMEOUT_SECONDS = float(os.getenv("MARKET_DATA_HTTP_TIMEOUT_SECONDS", "6"))
 
 
 def fetched_at() -> str:
@@ -358,7 +357,7 @@ class EastmoneyDirectMarketDataProvider:
                 "User-Agent": "Mozilla/5.0",
                 "Referer": "https://quote.eastmoney.com/center/gridlist.html",
             },
-            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            timeout=20,
         )
         response.raise_for_status()
         return response.json()
@@ -455,7 +454,7 @@ class SinaMarketDataProvider:
                 "_s_r_a": "page",
             },
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            timeout=20,
         )
         response.raise_for_status()
         data = response.json()
@@ -510,7 +509,7 @@ class SinaMarketDataProvider:
         else:
             url = "http://money.finance.sina.com.cn/q/view/newFLJK.php"
             params = {"param": "class"}
-        response = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
+        response = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         response.raise_for_status()
         response.encoding = response.apparent_encoding or response.encoding
         return response.text
@@ -597,7 +596,7 @@ class SinaMarketDataProvider:
             "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
             params={"symbol": symbol, "scale": 240, "ma": "no", "datalen": datalen},
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            timeout=20,
         )
         response.raise_for_status()
         data = response.json()
@@ -629,7 +628,7 @@ class SinaMarketDataProvider:
             "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
             params={"symbol": symbol, "scale": 1, "ma": "no", "datalen": datalen},
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            timeout=20,
         )
         response.raise_for_status()
         data = response.json()
@@ -704,7 +703,7 @@ class TencentMarketDataProvider:
         response = requests.get(
             "https://qt.gtimg.cn/q=" + ",".join(symbols),
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            timeout=20,
         )
         response.raise_for_status()
         response.encoding = "gbk"
@@ -1237,30 +1236,6 @@ class MarketDataService:
     def _module_failed(self, exc: Exception) -> dict[str, Any]:
         return {"status": "failed", "fetched_at": fetched_at(), "error": f"{type(exc).__name__}: {exc}"}
 
-    def _module_timeout(self, label: str, timeout_seconds: float) -> dict[str, Any]:
-        return {
-            "status": "failed",
-            "fetched_at": fetched_at(),
-            "error": f"TimeoutError: {label} timed out after {timeout_seconds:.1f}s",
-        }
-
-    def _call_with_timeout(self, label: str, timeout_seconds: float | None, func: Any) -> Any:
-        if timeout_seconds is None or timeout_seconds <= 0:
-            return func()
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(func)
-        try:
-            result = future.result(timeout=timeout_seconds)
-        except FuturesTimeoutError as exc:
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise TimeoutError(f"{label} timed out after {timeout_seconds:.1f}s") from exc
-        except Exception:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        executor.shutdown(wait=False, cancel_futures=True)
-        return result
-
     def _quote_detail(self, code: str) -> dict[str, Any]:
         fetched_time = fetched_at()
         quote_df = self.provider.quotes_for([code]) if hasattr(self.provider, "quotes_for") else self.provider.quotes()
@@ -1427,7 +1402,7 @@ class MarketDataService:
             )
         return {"status": "ok", "fetched_at": fetched_time, "rows": rows}
 
-    def _board_context(self, code: str, *, include_constituents: bool = True) -> dict[str, Any]:
+    def _board_context(self, code: str) -> dict[str, Any]:
         fetched_time = fetched_at()
         board_df = self.provider.boards()
         if board_df is None or board_df.empty:
@@ -1477,20 +1452,15 @@ class MarketDataService:
                     return row, matched_stock
             return None, None
 
-        industry_match, industry_stock = (
-            find_constituent_board(industry_rows)
-            if include_constituents and not industry_rows.empty
-            else (None, None)
-        )
+        industry_match, industry_stock = find_constituent_board(industry_rows) if not industry_rows.empty else (None, None)
         concept_matches: list[dict[str, Any]] = []
-        if include_constituents:
-            for row in concept_rows.head(20).to_dict(orient="records"):
-                matched_stock = constituent_match(row)
-                if matched_stock:
-                    row = dict(row)
-                    row["matched_by"] = "constituent"
-                    row["matched_stock"] = matched_stock
-                    concept_matches.append(row)
+        for row in concept_rows.head(20).to_dict(orient="records"):
+            matched_stock = constituent_match(row)
+            if matched_stock:
+                row = dict(row)
+                row["matched_by"] = "constituent"
+                row["matched_stock"] = matched_stock
+                concept_matches.append(row)
         if industry_match:
             work = pd.concat(
                 [
@@ -1503,18 +1473,13 @@ class MarketDataService:
             industry_rows = work[work.get("board_type", "").astype(str).str.contains("行业", na=False)] if "board_type" in work.columns else pd.DataFrame()
             concept_rows = work[work.get("board_type", "").astype(str).str.contains("概念", na=False)] if "board_type" in work.columns else pd.DataFrame()
         elif leader_col and matched.empty:
-            error = (
-                "Stock-to-board constituent mapping skipped for fast mode"
-                if not include_constituents
-                else "Stock-to-board mapping is unavailable from current public board source"
-            )
             return {
                 "status": "partial",
                 "fetched_at": fetched_time,
                 "industry": None,
                 "concepts": [],
                 "core_stocks": [],
-                "error": error,
+                "error": "Stock-to-board mapping is unavailable from current public board source",
             }
 
         industry_row = _first_row(industry_rows if not industry_rows.empty else work)
@@ -2946,8 +2911,6 @@ class MarketDataService:
     def stock_intraday_analysis(self, payload: dict[str, Any]) -> dict[str, Any]:
         code = normalize_code(payload.get("code", ""))
         limit = int(payload.get("intraday_limit", 0) or 0) or None
-        module_timeout_seconds = _nullable_float(payload.get("module_timeout_seconds"))
-        include_board_constituents = bool(payload.get("include_board_constituents", True))
         cash = None
         if isinstance(payload.get("account"), dict):
             cash = _nullable_float(payload["account"].get("cash"))
@@ -2955,19 +2918,16 @@ class MarketDataService:
         top_fetched_at = fetched_at()
         missing_fields: list[str] = []
 
-        def run_module(label: str, func: Any) -> Any:
-            return self._call_with_timeout(label, module_timeout_seconds, func)
-
         try:
-            quote = run_module("quote", lambda: self._quote_detail(code))
+            quote = self._quote_detail(code)
         except Exception as exc:  # noqa: BLE001
             quote = self._module_failed(exc)
         try:
-            intraday = run_module("intraday_1m", lambda: self._intraday_rows(code, limit=limit))
+            intraday = self._intraday_rows(code, limit=limit)
         except Exception as exc:  # noqa: BLE001
             intraday = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
         try:
-            order_book = run_module("order_book_5", lambda: self._order_book_5(code, cash=cash))
+            order_book = self._order_book_5(code, cash=cash)
         except Exception as exc:  # noqa: BLE001
             order_book = {"status": "failed", "fetched_at": fetched_at(), "bid": [], "ask": [], "error": f"{type(exc).__name__}: {exc}"}
         if payload.get("include_recent_trades", True) is False:
@@ -2979,25 +2939,19 @@ class MarketDataService:
             }
         else:
             try:
-                recent_trades = run_module(
-                    "recent_trades",
-                    lambda: self._recent_trade_rows(code, limit=int(payload.get("trade_limit", 100) or 100)),
-                )
+                recent_trades = self._recent_trade_rows(code, limit=int(payload.get("trade_limit", 100) or 100))
             except Exception as exc:  # noqa: BLE001
                 recent_trades = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
         try:
-            technical = run_module("technical", lambda: self._technical_indicators(code))
+            technical = self._technical_indicators(code)
         except Exception as exc:  # noqa: BLE001
             technical = self._module_failed(exc)
         try:
-            history = run_module("daily_history", lambda: self._history_rows(code))
+            history = self._history_rows(code)
         except Exception as exc:  # noqa: BLE001
             history = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
         try:
-            board = run_module(
-                "board",
-                lambda: self._board_context(code, include_constituents=include_board_constituents),
-            )
+            board = self._board_context(code)
         except Exception as exc:  # noqa: BLE001
             board = {"status": "failed", "fetched_at": fetched_at(), "industry": None, "concepts": [], "core_stocks": [], "error": f"{type(exc).__name__}: {exc}"}
         market = self._market_context(include_breadth=bool(payload.get("include_market_breadth", False)))
@@ -3177,18 +3131,13 @@ class MarketDataService:
     def market_snapshot(self) -> dict[str, Any]:
         quote_error = None
         index_error = None
-        timeout_seconds = float(os.getenv("MARKET_DATA_SNAPSHOT_TIMEOUT_SECONDS", "8"))
         try:
-            quotes = normalize_quotes_df(
-                self._call_with_timeout("market quotes", timeout_seconds, lambda: self.provider.quotes())
-            )
+            quotes = normalize_quotes_df(self.provider.quotes())
         except Exception as exc:  # noqa: BLE001
             quotes = pd.DataFrame()
             quote_error = f"{type(exc).__name__}: {exc}"
         try:
-            indices = normalize_quotes_df(
-                self._call_with_timeout("market indices", timeout_seconds, lambda: self.provider.indices())
-            )
+            indices = normalize_quotes_df(self.provider.indices())
         except Exception as exc:  # noqa: BLE001
             indices = pd.DataFrame()
             index_error = f"{type(exc).__name__}: {exc}"
@@ -3276,9 +3225,8 @@ class MarketDataService:
         return response_envelope(data, source=self.source)
 
     def hot_boards(self) -> dict[str, Any]:
-        timeout_seconds = float(os.getenv("MARKET_DATA_BOARDS_TIMEOUT_SECONDS", "8"))
         try:
-            board_df = self._call_with_timeout("hot boards", timeout_seconds, lambda: self.provider.boards())
+            board_df = self.provider.boards()
         except Exception as exc:  # noqa: BLE001
             return self._unavailable(exc)
         if board_df is None or board_df.empty:
@@ -3519,18 +3467,10 @@ class MarketDataService:
         mode = str(payload.get("mode", "fast") or "fast").lower()
         fast_mode = mode != "deep"
         intraday_limit = int(payload.get("intraday_limit", 60 if fast_mode else 0) or 0)
-        timeout_seconds = float(payload.get("timeout_seconds", 25 if fast_mode else 55) or (25 if fast_mode else 55))
-        module_timeout_seconds = float(payload.get("module_timeout_seconds", 4 if fast_mode else 8) or (4 if fast_mode else 8))
         max_workers = max(1, min(int(payload.get("max_workers", 4) or 4), len(positions) or 1))
 
-        try:
-            market = self._call_with_timeout("market snapshot", 8 if fast_mode else 15, self.market_snapshot)
-        except Exception as exc:  # noqa: BLE001
-            market = self._unavailable(exc)
-        try:
-            boards = self._call_with_timeout("hot boards", 8 if fast_mode else 15, self.hot_boards)
-        except Exception as exc:  # noqa: BLE001
-            boards = self._unavailable(exc)
+        market = self.market_snapshot()
+        boards = self.hot_boards()
 
         def analyze_position(item: dict[str, Any]) -> dict[str, Any]:
             stock_payload: dict[str, Any] = {
@@ -3539,79 +3479,20 @@ class MarketDataService:
                 "include_recent_trades": not fast_mode,
                 "include_zt_pool": not fast_mode,
                 "include_market_breadth": False,
-                "include_board_constituents": not fast_mode,
-                "module_timeout_seconds": module_timeout_seconds,
                 "account": {"cash": cash, "positions": positions},
             }
             if not fast_mode:
                 stock_payload["trade_limit"] = int(payload.get("trade_limit", 100) or 100)
             return self.stock_intraday_analysis(stock_payload)
 
-        def timeout_analysis(item: dict[str, Any]) -> dict[str, Any]:
-            code = normalize_code(item.get("code", ""))
-            return {
-                "code": code,
-                "name": item.get("name"),
-                "freshness": "failed",
-                "fetched_at": fetched_at(),
-                "data_quality": {
-                    "quote_status": "failed",
-                    "intraday_status": "failed",
-                    "order_book_status": "failed",
-                    "recent_trades_status": "skipped" if fast_mode else "failed",
-                    "board_status": "failed",
-                    "technical_status": "failed",
-                    "history_status": "failed",
-                    "timeout": True,
-                    "missing_fields": ["analysis.timeout"],
-                },
-                "quote": {},
-                "account": {
-                    "cash": cash,
-                    "shares": _nullable_int(item.get("shares")),
-                    "available": _nullable_int(item.get("available")),
-                    "cost": _nullable_float(item.get("cost")),
-                },
-                "decision_score": {
-                    "total_score": None,
-                    "suggested_action": "数据超时，先不做交易结论",
-                    "confidence": "低",
-                },
-                "trading_plan": {
-                    "plan_type": "timeout_guard",
-                    "action": "等待数据恢复或改用单股快速核验",
-                },
-                "error": f"Position analysis timed out after {timeout_seconds:.1f}s",
-            }
-
         analyses: list[dict[str, Any]] = []
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        future_to_position = {executor.submit(analyze_position, item): item for item in positions}
-        done, not_done = wait(future_to_position, timeout=timeout_seconds)
-        for future in done:
-            try:
-                analyses.append(future.result())
-            except Exception as exc:  # noqa: BLE001
-                item = future_to_position[future]
-                analyses.append(
-                    {
-                        "code": normalize_code(item.get("code", "")),
-                        "name": item.get("name"),
-                        "freshness": "failed",
-                        "data_quality": {},
-                        "account": {
-                            "cash": cash,
-                            "shares": _nullable_int(item.get("shares")),
-                            "available": _nullable_int(item.get("available")),
-                            "cost": _nullable_float(item.get("cost")),
-                        },
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-        for future in not_done:
-            future.cancel()
-            analyses.append(timeout_analysis(future_to_position[future]))
-        executor.shutdown(wait=False, cancel_futures=True)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(analyze_position, item) for item in positions]
+            for future in as_completed(futures):
+                try:
+                    analyses.append(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    analyses.append({"freshness": "failed", "data_quality": {}, "error": f"{type(exc).__name__}: {exc}"})
 
         position_order = {normalize_code(item.get("code", "")): index for index, item in enumerate(positions)}
         analyses.sort(key=lambda item: position_order.get(normalize_code(item.get("code", "")), 9999))
@@ -3675,9 +3556,7 @@ class MarketDataService:
         return response_envelope(
             {
                 "mode": "fast" if fast_mode else "deep",
-                "speed_note": "一次调用聚合市场、板块和全部持仓；fast模式默认跳过最近成交、涨停池和板块成分慢映射，并设置硬超时，避免盘中卡死。",
-                "timeout_seconds": timeout_seconds,
-                "module_timeout_seconds": module_timeout_seconds,
+                "speed_note": "一次调用聚合市场、板块和全部持仓；fast模式默认跳过最近成交和涨停池以减少等待。",
                 "market_snapshot": market.get("data"),
                 "hot_boards": boards.get("data"),
                 "positions": compact_positions,
