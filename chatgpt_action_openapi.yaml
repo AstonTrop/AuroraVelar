@@ -171,7 +171,7 @@ paths:
           description: 近期已推荐或重点观察过的股票代码，逗号分隔；这些股票默认降级到观察池，避免重复推荐
       responses:
         "200":
-          description: 返回分层候选：candidates/buy_now为现在可买，wait_pullback为等回踩，wait_breakout为等突破，watch_only为只观察，rejected为剔除；不能把非buy_now写成推荐买入。
+          description: 返回分层候选：buy_now/candidates仅表示现在可执行；strong_buy才可写成强推荐可买；trial_buy只能写小仓试错；conditional_buy只能条件观察；wait_pullback等回踩，wait_breakout等突破，watch_only只观察，rejected剔除。每只buy_now还包含trade_quality_tier、risk_reward_ratio、intraday_failure_line、daily_hard_stop_line、quality_reasons、downgrade_reasons，GPT必须用这些字段做二次质量判断。
   /candidates/verify:
     post:
       operationId: verifyCandidates

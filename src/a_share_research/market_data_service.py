@@ -3641,6 +3641,112 @@ class MarketDataService:
             return "现在可买", "盘口可买且涨幅未过热，但技术买点缺失，需小仓并补充核验", None
         return "只观察", "缺少可执行买点或涨跌状态不适合立即交易", distance_pct
 
+    def _candidate_trade_quality(
+        self,
+        *,
+        name: str,
+        latest_price: float | None,
+        day_change_pct: float | None,
+        technical_score: float | None,
+        buy_point: float | None,
+        sell_point: float | None,
+        stop_loss_point: float | None,
+        buy_point_distance_pct: float | None,
+        execution_bucket: str,
+    ) -> dict[str, Any]:
+        quality_reasons: list[str] = []
+        downgrade_reasons: list[str] = []
+        risk_reward_ratio: float | None = None
+        upside_pct: float | None = None
+        downside_pct: float | None = None
+        intraday_failure_line: float | None = None
+        daily_hard_stop_line: float | None = None
+
+        if latest_price is not None and latest_price > 0:
+            if sell_point is not None and sell_point > latest_price:
+                upside_pct = round((sell_point - latest_price) / latest_price * 100, 2)
+            if stop_loss_point is not None and 0 < stop_loss_point < latest_price:
+                daily_hard_stop_line = round(stop_loss_point, 4)
+                downside_pct = round((latest_price - stop_loss_point) / latest_price * 100, 2)
+            if upside_pct is not None and downside_pct not in (None, 0):
+                risk_reward_ratio = round(upside_pct / downside_pct, 2)
+            if buy_point is not None and buy_point > 0:
+                intraday_failure_line = round(min(latest_price, buy_point), 4)
+
+        normalized_name = name.strip().upper()
+        if normalized_name.startswith("XD"):
+            downgrade_reasons.append("XD/除权股默认降级")
+        if execution_bucket != "现在可买":
+            downgrade_reasons.append("不属于现在可买分层")
+        if technical_score is None or pd.isna(technical_score):
+            downgrade_reasons.append("技术评分缺失")
+        elif technical_score < 55:
+            downgrade_reasons.append("技术评分不足")
+        else:
+            quality_reasons.append("技术评分达到基础门槛")
+        if buy_point_distance_pct is None:
+            downgrade_reasons.append("买点距离不可确认")
+        elif abs(buy_point_distance_pct) <= 1.5:
+            quality_reasons.append("现价贴合买点")
+        elif abs(buy_point_distance_pct) <= 3:
+            quality_reasons.append("现价仍在买点3%以内")
+        else:
+            downgrade_reasons.append("现价离买点偏远")
+        if day_change_pct is None or pd.isna(day_change_pct):
+            downgrade_reasons.append("日内涨跌幅缺失")
+        elif day_change_pct >= 6:
+            downgrade_reasons.append("涨幅偏高，容易变成追高")
+        elif -1 <= day_change_pct <= 4.5:
+            quality_reasons.append("涨幅未过热")
+        if downside_pct is None:
+            downgrade_reasons.append("盘中风险空间不可确认")
+        elif downside_pct > 8:
+            downgrade_reasons.append("止损空间过大")
+        elif downside_pct <= 6:
+            quality_reasons.append("止损空间可控")
+        if risk_reward_ratio is None:
+            downgrade_reasons.append("风险收益比不可确认")
+        elif risk_reward_ratio < 1.2:
+            downgrade_reasons.append("风险收益比不足")
+        elif risk_reward_ratio >= 1.5:
+            quality_reasons.append("风险收益比达标")
+
+        strong_conditions = [
+            execution_bucket == "现在可买",
+            not normalized_name.startswith("XD"),
+            technical_score is not None and not pd.isna(technical_score) and technical_score >= 55,
+            buy_point_distance_pct is not None and abs(buy_point_distance_pct) <= 2.0,
+            day_change_pct is not None and not pd.isna(day_change_pct) and day_change_pct < 6,
+            downside_pct is not None and downside_pct <= 6,
+            risk_reward_ratio is not None and risk_reward_ratio >= 1.5,
+        ]
+        trial_conditions = [
+            execution_bucket == "现在可买",
+            technical_score is not None and not pd.isna(technical_score) and technical_score >= 45,
+            buy_point_distance_pct is not None and abs(buy_point_distance_pct) <= 3.0,
+            day_change_pct is not None and not pd.isna(day_change_pct) and day_change_pct < 7.5,
+            downside_pct is not None and downside_pct <= 8,
+            risk_reward_ratio is not None and risk_reward_ratio >= 1.2,
+        ]
+        if all(strong_conditions):
+            tier = "强推荐可买"
+        elif all(trial_conditions):
+            tier = "小仓试错"
+        else:
+            tier = "条件观察"
+
+        return {
+            "trade_quality_tier": tier,
+            "risk_reward_ratio": risk_reward_ratio,
+            "upside_pct": upside_pct,
+            "downside_pct": downside_pct,
+            "intraday_failure_line": intraday_failure_line,
+            "daily_hard_stop_line": daily_hard_stop_line,
+            "quality_reasons": list(dict.fromkeys(quality_reasons)),
+            "downgrade_reasons": list(dict.fromkeys(downgrade_reasons)),
+            "usage_note": "buy_now只代表可执行；trade_quality_tier才决定是否可写成强推荐、小仓试错或条件观察。",
+        }
+
     def actionable_candidates(
         self,
         cash: float,
@@ -3670,7 +3776,17 @@ class MarketDataService:
         work = work[~work["name"].map(is_st_name)]
         if work.empty:
             return response_envelope(
-                {"candidates": [], "buy_now": [], "wait_pullback": [], "wait_breakout": [], "watch_only": [], "rejected": []},
+                {
+                    "candidates": [],
+                    "buy_now": [],
+                    "strong_buy": [],
+                    "trial_buy": [],
+                    "conditional_buy": [],
+                    "wait_pullback": [],
+                    "wait_breakout": [],
+                    "watch_only": [],
+                    "rejected": [],
+                },
                 source=self.source,
             )
         change = pd.to_numeric(work["day_change_pct"], errors="coerce").fillna(0.0)
@@ -3712,6 +3828,8 @@ class MarketDataService:
             latest_price = _nullable_float(row["latest_price"])
             technical_score = _nullable_float(tech_data.get("technical_score"))
             buy_point = _nullable_float(tech_data.get("buy_point"))
+            sell_point = _nullable_float(tech_data.get("sell_point"))
+            stop_loss_point = _nullable_float(tech_data.get("stop_loss_point"))
             bucket, bucket_reason, distance_pct = self._candidate_execution_bucket(
                 latest_price=latest_price,
                 day_change_pct=day_change_pct,
@@ -3729,18 +3847,33 @@ class MarketDataService:
                 "technical_score": technical_score,
                 "buy_point": buy_point,
                 "buy_point_distance_pct": distance_pct,
-                "sell_point": tech_data.get("sell_point"),
-                "stop_loss_point": tech_data.get("stop_loss_point"),
+                "sell_point": sell_point,
+                "stop_loss_point": stop_loss_point,
                 "technical_point_sources": tech_data.get("technical_point_sources"),
                 "execution_bucket": bucket,
                 "execution_reason": bucket_reason,
                 "candidate_source": "broad_mainboard_scan",
             }
+            item.update(
+                self._candidate_trade_quality(
+                    name=name,
+                    latest_price=latest_price,
+                    day_change_pct=day_change_pct,
+                    technical_score=technical_score,
+                    buy_point=buy_point,
+                    sell_point=sell_point,
+                    stop_loss_point=stop_loss_point,
+                    buy_point_distance_pct=distance_pct,
+                    execution_bucket=bucket,
+                )
+            )
             if code in previous_codes and bucket == "现在可买":
                 item["duplicate_status"] = "近期已推荐，默认降级观察"
                 item["execution_reason"] = f"{bucket_reason}；但该股近期已经推荐过，本次不作为新的买入推荐"
                 bucket = "只观察"
                 item["execution_bucket"] = bucket
+                item["trade_quality_tier"] = "条件观察"
+                item["downgrade_reasons"] = list(dict.fromkeys([*item.get("downgrade_reasons", []), "近期已推荐"]))
             if bucket == "剔除":
                 rejected.append({"code": code, "name": name, "reason": bucket_reason})
             else:
@@ -3748,15 +3881,21 @@ class MarketDataService:
             if len(buckets["现在可买"]) >= limit:
                 break
         buy_now = buckets["现在可买"][:limit]
+        strong_buy = [item for item in buy_now if item.get("trade_quality_tier") == "强推荐可买"]
+        trial_buy = [item for item in buy_now if item.get("trade_quality_tier") == "小仓试错"]
+        conditional_buy = [item for item in buy_now if item.get("trade_quality_tier") == "条件观察"]
         return response_envelope(
             {
                 "candidates": buy_now,
                 "buy_now": buy_now,
+                "strong_buy": strong_buy,
+                "trial_buy": trial_buy,
+                "conditional_buy": conditional_buy,
                 "wait_pullback": buckets["等回踩"][:limit],
                 "wait_breakout": buckets["等突破"][:limit],
                 "watch_only": buckets["只观察"][:limit],
                 "rejected": rejected,
-                "selection_policy": "先扩大主板非ST扫描，再按当下可执行性分层；只有buy_now/candidates才可写成现在可买。",
+                "selection_policy": "先扩大主板非ST扫描，再按当下可执行性分层；buy_now只代表可执行，strong_buy才可写成强推荐，trial_buy只能小仓试错，conditional_buy只能条件观察。",
             },
             source=self.source,
         )

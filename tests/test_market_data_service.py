@@ -220,6 +220,43 @@ def test_actionable_candidates_moves_recent_recommendations_to_watch_only() -> N
     assert out["data"]["watch_only"][0]["duplicate_status"] == "近期已推荐，默认降级观察"
 
 
+def test_actionable_candidates_separates_strong_buy_from_loose_buy_now() -> None:
+    class CandidateQualityService(MarketDataService):
+        def technical(self, code: str, report_date: date | None = None) -> dict:
+            profiles = {
+                "000001": {"technical_score": 70.0, "buy_point": 9.95, "sell_point": 10.9, "stop_loss_point": 9.7, "technical_point_sources": "测试强结构"},
+                "000002": {"technical_score": 70.0, "buy_point": 19.14, "sell_point": 20.1, "stop_loss_point": 16.67, "technical_point_sources": "测试宽止损"},
+                "603926": {"technical_score": 70.0, "buy_point": 19.14, "sell_point": 22.0, "stop_loss_point": 18.8, "technical_point_sources": "测试XD"},
+            }
+            return {"freshness": "live", "data": {"code": code, **profiles[code]}}
+
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "000001", "名称": "强结构A", "最新价": 10.0, "涨跌幅": 2.0, "换手率": 4.0, "量比": 1.3},
+                {"代码": "000002", "名称": "止损太宽B", "最新价": 19.24, "涨跌幅": 2.0, "换手率": 5.0, "量比": 1.4},
+                {"代码": "603926", "名称": "XD铁流股", "最新价": 19.24, "涨跌幅": 2.0, "换手率": 5.0, "量比": 1.4},
+            ]
+        ),
+        bidasks={
+            code: pd.DataFrame([{"item": "最新", "value": price}, {"item": "涨幅", "value": 2.0}, {"item": "sell_1", "value": price + 0.01}, {"item": "buy_1", "value": price}])
+            for code, price in {"000001": 10.0, "000002": 19.24, "603926": 19.24}.items()
+        },
+    )
+
+    out = CandidateQualityService(provider=provider).actionable_candidates(cash=6000.0, price_limit=30.0, limit=5)
+    data = out["data"]
+    by_code = {item["code"]: item for item in data["buy_now"]}
+
+    assert [item["code"] for item in data["strong_buy"]] == ["000001"]
+    assert by_code["000001"]["trade_quality_tier"] == "强推荐可买"
+    assert by_code["000001"]["risk_reward_ratio"] >= 1.5
+    assert by_code["000002"]["trade_quality_tier"] in {"条件观察", "小仓试错"}
+    assert "止损空间过大" in by_code["000002"]["downgrade_reasons"] or "风险收益比不足" in by_code["000002"]["downgrade_reasons"]
+    assert by_code["603926"]["trade_quality_tier"] != "强推荐可买"
+    assert "XD/除权股默认降级" in by_code["603926"]["downgrade_reasons"]
+
+
 def test_verify_candidates_scores_chatgpt_candidates_without_full_market_scan() -> None:
     class CandidateProvider(StaticMarketDataProvider):
         def quotes(self) -> pd.DataFrame:
