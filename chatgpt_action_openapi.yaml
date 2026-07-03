@@ -248,8 +248,8 @@ paths:
     post:
       operationId: getPortfolioIntradayDecision
       x-openai-isConsequential: false
-      summary: 快速聚合盘中持仓决策数据
-      description: 一次调用聚合市场状态、热门板块、全部持仓单票深挖摘要、三日走势、分时、盘口、板块匹配、技术关键位、账户约束和执行提示。默认fast模式跳过最近成交和涨停池以减少等待，适合竞价和盘中快速判断；deep模式用于盘后或需要最近成交时。
+      summary: 组合快速分析：快速聚合盘中持仓决策数据
+      description: 当用户只说分析持仓、看看现在仓位、竞价分析、盘中看一下、总体分析一下时，默认优先使用本操作做组合快速分析。一次调用聚合市场状态、热门板块、全部持仓单票深挖摘要、三日走势、分时、盘口、板块匹配、技术关键位、账户约束和执行提示。默认fast模式跳过最近成交和涨停池以减少等待，适合竞价和盘中快速判断；deep模式用于盘后或需要最近成交时。
       requestBody:
         required: true
         content:

@@ -1071,6 +1071,16 @@ def test_openapi_marks_read_only_actions_as_non_consequential() -> None:
         assert "x-openai-isConsequential: false" in section
 
 
+def test_gpt_instructions_define_default_fast_portfolio_analysis() -> None:
+    instructions = Path("GPT_STOCK_TRADING_ASSISTANT_V4_2.md").read_text(encoding="utf-8")
+    schema_text = Path("chatgpt_action_openapi.yaml").read_text(encoding="utf-8")
+
+    assert "默认组合快速分析" in instructions
+    assert "用户只说分析持仓" in instructions
+    assert "组合快速分析" in schema_text
+    assert "用户只说分析持仓" in schema_text
+
+
 def test_privacy_endpoint_returns_plain_policy_page() -> None:
     from fastapi.testclient import TestClient
 
