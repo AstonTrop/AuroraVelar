@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 
@@ -986,6 +987,88 @@ def test_market_snapshot_partial_fallback_uses_json_safe_nulls() -> None:
     assert out["freshness"] == "partial_live"
     assert out["data"]["breadth_available"] is False
     assert out["data"]["indices"][0]["turnover_rate"] is None
+
+
+def test_portfolio_intraday_decision_fast_mode_skips_slow_recent_trades() -> None:
+    class FastProvider(StaticMarketDataProvider):
+        def recent_trades(self, code: str, limit: int = 100) -> pd.DataFrame:
+            raise AssertionError("fast portfolio decision should not call slow recent trades")
+
+    hist_df = pd.DataFrame(
+        {
+            "日期": [f"2026-06-{day:02d}" for day in range(1, 31)] + [f"2026-07-{day:02d}" for day in range(1, 31)],
+            "开盘": [8.0 + i * 0.01 for i in range(60)],
+            "最高": [8.1 + i * 0.01 for i in range(60)],
+            "最低": [7.9 + i * 0.01 for i in range(60)],
+            "收盘": [8.0 + i * 0.01 for i in range(60)],
+            "成交量": [100000 + i * 1000 for i in range(60)],
+        }
+    )
+    provider = FastProvider(
+        quotes=pd.DataFrame(
+            [
+                {"代码": "000725", "名称": "京东方A", "最新价": 9.1, "涨跌幅": 1.2, "今开": 9.0, "最高": 9.2, "最低": 8.9},
+                {"代码": "600879", "名称": "航天电子", "最新价": 20.9, "涨跌幅": -0.8, "今开": 21.0, "最高": 21.2, "最低": 20.8},
+            ]
+        ),
+        indices=pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}]),
+        boards_df=pd.DataFrame(
+            [
+                {
+                    "board_type": "行业",
+                    "board_name": "电子元件",
+                    "change_pct": 1.0,
+                    "up_ratio": 0.6,
+                    "leader_code": "000725",
+                    "leader": "京东方A",
+                    "leader_price": 9.1,
+                    "leader_change_pct": 1.2,
+                    "board_action": "可参与",
+                }
+            ]
+        ),
+        bidasks={
+            "000725": pd.DataFrame([{"item": "最新", "value": 9.1}, {"item": "涨幅", "value": 1.2}, {"item": "buy_1", "value": 9.1}, {"item": "sell_1", "value": 9.11}]),
+            "600879": pd.DataFrame([{"item": "最新", "value": 20.9}, {"item": "涨幅", "value": -0.8}, {"item": "buy_1", "value": 20.9}, {"item": "sell_1", "value": 20.91}]),
+        },
+        hist={"000725": hist_df, "600879": hist_df},
+        intraday={
+            "000725": pd.DataFrame([{"time": "10:00", "close": 9.1, "avg_price": 9.05, "volume": 10000, "amount": 91000}]),
+            "600879": pd.DataFrame([{"time": "10:00", "close": 20.9, "avg_price": 21.0, "volume": 8000, "amount": 167200}]),
+        },
+    )
+
+    out = MarketDataService(provider=provider).portfolio_intraday_decision(
+        {
+            "cash": 3000,
+            "mode": "fast",
+            "positions": [
+                {"code": "000725", "name": "京东方A", "shares": 100, "available": 100, "cost": 8.6},
+                {"code": "600879", "name": "航天电子", "shares": 100, "available": 100, "cost": 21.3},
+            ],
+        }
+    )
+
+    assert out["freshness"] in {"live", "partial_live"}
+    assert out["data"]["mode"] == "fast"
+    assert len(out["data"]["positions"]) == 2
+    assert out["data"]["positions"][0]["recent_trades_status"] == "skipped"
+    assert "一次调用" in out["data"]["speed_note"]
+
+
+def test_openapi_marks_read_only_actions_as_non_consequential() -> None:
+    schema_text = Path("chatgpt_action_openapi.yaml").read_text(encoding="utf-8")
+
+    for operation_id in [
+        "getMarketSnapshot",
+        "getHotBoards",
+        "getStockIntradayAnalysis",
+        "getPortfolioIntradayDecision",
+        "verifyCandidates",
+    ]:
+        section_start = schema_text.index(f"operationId: {operation_id}")
+        section = schema_text[section_start : section_start + 500]
+        assert "x-openai-isConsequential: false" in section
 
 
 def test_privacy_endpoint_returns_plain_policy_page() -> None:

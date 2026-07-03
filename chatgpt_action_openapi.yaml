@@ -10,6 +10,7 @@ paths:
   /health:
     get:
       operationId: health
+      x-openai-isConsequential: false
       summary: 检查行情服务状态
       responses:
         "200":
@@ -17,6 +18,7 @@ paths:
   /market/snapshot:
     get:
       operationId: getMarketSnapshot
+      x-openai-isConsequential: false
       summary: 获取实时大盘快照
       responses:
         "200":
@@ -24,6 +26,7 @@ paths:
   /stock/quotes:
     get:
       operationId: getStockQuotes
+      x-openai-isConsequential: false
       summary: 获取多只股票实时行情
       parameters:
         - name: codes
@@ -38,6 +41,7 @@ paths:
   /stock/bidask:
     get:
       operationId: getStockBidAsk
+      x-openai-isConsequential: false
       summary: 获取个股五档盘口和可执行性
       parameters:
         - name: code
@@ -56,6 +60,7 @@ paths:
   /boards/hot:
     get:
       operationId: getHotBoards
+      x-openai-isConsequential: false
       summary: 获取热门板块
       responses:
         "200":
@@ -63,6 +68,7 @@ paths:
   /stock/technical:
     get:
       operationId: getStockTechnical
+      x-openai-isConsequential: false
       summary: 获取个股技术分析点位
       parameters:
         - name: code
@@ -76,6 +82,7 @@ paths:
   /stock/intraday-analysis:
     post:
       operationId: getStockIntradayAnalysis
+      x-openai-isConsequential: false
       summary: 获取单只股票盘中交易分析数据结构
       description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、最近三日走势、当日分时总结、K线结构、均线结构、量价关系、相对强弱、支撑压力区、风险波动、盘口解释、板块-个股匹配、市场状态、涨停池关联、账户约束、偏进攻交易评分、交易计划、技术解读包、回答完整性检查、执行检查清单、明日三情景和复盘记录，用于盘中买卖点判断。
       requestBody:
@@ -97,6 +104,14 @@ paths:
                 include_market_breadth:
                   type: boolean
                   description: 是否在单票深挖时同时抓全市场涨跌家数；默认false以避免免费云服务超时，需要完整市场广度时优先单独调用getMarketSnapshot
+                include_recent_trades:
+                  type: boolean
+                  description: 是否抓最近成交明细；竞价或盘中快速分析可设为false以减少等待
+                  default: true
+                include_zt_pool:
+                  type: boolean
+                  description: 是否抓涨停池关联；竞价或盘中快速分析可设为false以减少等待
+                  default: true
                 account:
                   type: object
                   description: 用户账户约束，可由截图或手工输入转换而来
@@ -128,6 +143,7 @@ paths:
   /candidates/actionable:
     get:
       operationId: getActionableCandidates
+      x-openai-isConsequential: false
       summary: 获取可执行候选股
       parameters:
         - name: cash
@@ -153,6 +169,7 @@ paths:
   /candidates/verify:
     post:
       operationId: verifyCandidates
+      x-openai-isConsequential: false
       summary: 核验由ChatGPT或用户提供的候选股票
       description: 对候选股票逐只核验实时价格、盘口可执行性、技术点位、现金约束、主板范围、追高风险和候选生命周期，用于判断是否值得推荐，并避免重复推荐老股票。
       requestBody:
@@ -198,6 +215,7 @@ paths:
   /portfolio/analyze:
     post:
       operationId: analyzePortfolio
+      x-openai-isConsequential: false
       summary: 基于实时行情分析持仓
       requestBody:
         required: true
@@ -226,6 +244,56 @@ paths:
       responses:
         "200":
           description: 持仓诊断、T+1约束和操作建议
+  /portfolio/intraday-decision:
+    post:
+      operationId: getPortfolioIntradayDecision
+      x-openai-isConsequential: false
+      summary: 快速聚合盘中持仓决策数据
+      description: 一次调用聚合市场状态、热门板块、全部持仓单票深挖摘要、三日走势、分时、盘口、板块匹配、技术关键位、账户约束和执行提示。默认fast模式跳过最近成交和涨停池以减少等待，适合竞价和盘中快速判断；deep模式用于盘后或需要最近成交时。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum:
+                    - fast
+                    - deep
+                  default: fast
+                  description: fast更快，默认跳过最近成交和涨停池；deep更完整但更慢
+                cash:
+                  type: number
+                  description: 当前可用现金
+                intraday_limit:
+                  type: integer
+                  description: fast模式默认返回最近60条1分钟分时摘要所需数据
+                max_workers:
+                  type: integer
+                  description: 后端并行抓取持仓数量，默认最多4
+                positions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      name:
+                        type: string
+                      shares:
+                        type: integer
+                      available:
+                        type: integer
+                      cost:
+                        type: number
+              required:
+                - cash
+                - positions
+      responses:
+        "200":
+          description: 市场、板块、持仓摘要和每只持仓的核心盘中分析字段，用于替代多次串行调用。
   /reviews/log:
     post:
       operationId: logReview

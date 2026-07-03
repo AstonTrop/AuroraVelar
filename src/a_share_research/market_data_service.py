@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -2929,10 +2930,18 @@ class MarketDataService:
             order_book = self._order_book_5(code, cash=cash)
         except Exception as exc:  # noqa: BLE001
             order_book = {"status": "failed", "fetched_at": fetched_at(), "bid": [], "ask": [], "error": f"{type(exc).__name__}: {exc}"}
-        try:
-            recent_trades = self._recent_trade_rows(code, limit=int(payload.get("trade_limit", 100) or 100))
-        except Exception as exc:  # noqa: BLE001
-            recent_trades = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
+        if payload.get("include_recent_trades", True) is False:
+            recent_trades = {
+                "status": "skipped",
+                "fetched_at": fetched_at(),
+                "rows": [],
+                "skip_reason": "fast mode skips slow recent-trade source",
+            }
+        else:
+            try:
+                recent_trades = self._recent_trade_rows(code, limit=int(payload.get("trade_limit", 100) or 100))
+            except Exception as exc:  # noqa: BLE001
+                recent_trades = {"status": "failed", "fetched_at": fetched_at(), "rows": [], "error": f"{type(exc).__name__}: {exc}"}
         try:
             technical = self._technical_indicators(code)
         except Exception as exc:  # noqa: BLE001
@@ -2946,7 +2955,15 @@ class MarketDataService:
         except Exception as exc:  # noqa: BLE001
             board = {"status": "failed", "fetched_at": fetched_at(), "industry": None, "concepts": [], "core_stocks": [], "error": f"{type(exc).__name__}: {exc}"}
         market = self._market_context(include_breadth=bool(payload.get("include_market_breadth", False)))
-        zt_related = self._zt_pool_related(code)
+        if payload.get("include_zt_pool", True) is False:
+            zt_related = {
+                "status": "skipped",
+                "fetched_at": fetched_at(),
+                "related": [],
+                "skip_reason": "fast mode skips limit-up pool",
+            }
+        else:
+            zt_related = self._zt_pool_related(code)
         account = self._account_context(payload.get("account", {}) or {}, quote, board)
 
         required_quote_fields = [
@@ -3444,6 +3461,116 @@ class MarketDataService:
                 break
         return response_envelope({"candidates": candidates, "rejected": rejected}, source=self.source)
 
+    def portfolio_intraday_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cash = float(payload.get("cash", 0.0) or 0.0)
+        positions = payload.get("positions", []) or []
+        mode = str(payload.get("mode", "fast") or "fast").lower()
+        fast_mode = mode != "deep"
+        intraday_limit = int(payload.get("intraday_limit", 60 if fast_mode else 0) or 0)
+        max_workers = max(1, min(int(payload.get("max_workers", 4) or 4), len(positions) or 1))
+
+        market = self.market_snapshot()
+        boards = self.hot_boards()
+
+        def analyze_position(item: dict[str, Any]) -> dict[str, Any]:
+            stock_payload: dict[str, Any] = {
+                "code": item.get("code", ""),
+                "intraday_limit": intraday_limit,
+                "include_recent_trades": not fast_mode,
+                "include_zt_pool": not fast_mode,
+                "include_market_breadth": False,
+                "account": {"cash": cash, "positions": positions},
+            }
+            if not fast_mode:
+                stock_payload["trade_limit"] = int(payload.get("trade_limit", 100) or 100)
+            return self.stock_intraday_analysis(stock_payload)
+
+        analyses: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(analyze_position, item) for item in positions]
+            for future in as_completed(futures):
+                try:
+                    analyses.append(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    analyses.append({"freshness": "failed", "data_quality": {}, "error": f"{type(exc).__name__}: {exc}"})
+
+        position_order = {normalize_code(item.get("code", "")): index for index, item in enumerate(positions)}
+        analyses.sort(key=lambda item: position_order.get(normalize_code(item.get("code", "")), 9999))
+
+        compact_positions = []
+        selected_analyses = []
+        for analysis in analyses:
+            quote = analysis.get("quote", {}) if isinstance(analysis, dict) else {}
+            data_quality = analysis.get("data_quality", {}) if isinstance(analysis, dict) else {}
+            account = analysis.get("account", {}) if isinstance(analysis, dict) else {}
+            compact_positions.append(
+                {
+                    "code": normalize_code(analysis.get("code", "")),
+                    "name": analysis.get("name"),
+                    "freshness": analysis.get("freshness"),
+                    "latest_price": quote.get("latest_price"),
+                    "change_pct": quote.get("change_pct"),
+                    "shares": account.get("shares"),
+                    "available": account.get("available"),
+                    "cost": account.get("cost"),
+                    "market_value": account.get("market_value"),
+                    "profit_loss": account.get("profit_loss"),
+                    "decision_score": (analysis.get("decision_score") or {}).get("total_score"),
+                    "suggested_action": (analysis.get("decision_score") or {}).get("suggested_action"),
+                    "board_status": data_quality.get("board_status"),
+                    "intraday_status": data_quality.get("intraday_status"),
+                    "order_book_status": data_quality.get("order_book_status"),
+                    "recent_trades_status": data_quality.get("recent_trades_status"),
+                    "technical_status": data_quality.get("technical_status"),
+                }
+            )
+            selected_analyses.append(
+                {
+                    "code": normalize_code(analysis.get("code", "")),
+                    "name": analysis.get("name"),
+                    "freshness": analysis.get("freshness"),
+                    "data_quality": data_quality,
+                    "quote": quote,
+                    "recent_3d_context": analysis.get("recent_3d_context"),
+                    "today_intraday_summary": analysis.get("today_intraday_summary"),
+                    "moving_average_structure": analysis.get("moving_average_structure"),
+                    "volume_price_relation": analysis.get("volume_price_relation"),
+                    "board_stock_alignment": analysis.get("board_stock_alignment"),
+                    "order_book_interpretation": analysis.get("order_book_interpretation"),
+                    "position_risk_contribution": analysis.get("position_risk_contribution"),
+                    "technical_level_layers": analysis.get("technical_level_layers"),
+                    "next_session_scenarios": analysis.get("next_session_scenarios"),
+                    "decision_score": analysis.get("decision_score"),
+                    "trading_plan": analysis.get("trading_plan"),
+                }
+            )
+
+        freshness_values = [market.get("freshness"), boards.get("freshness"), *(item.get("freshness") for item in analyses)]
+        if all(value in {"failed", "unavailable"} for value in freshness_values if value):
+            freshness = "unavailable"
+        elif any(value in {"failed", "unavailable", "stale_cache"} for value in freshness_values):
+            freshness = "partial_live"
+        else:
+            freshness = "live"
+
+        return response_envelope(
+            {
+                "mode": "fast" if fast_mode else "deep",
+                "speed_note": "一次调用聚合市场、板块和全部持仓；fast模式默认跳过最近成交和涨停池以减少等待。",
+                "market_snapshot": market.get("data"),
+                "hot_boards": boards.get("data"),
+                "positions": compact_positions,
+                "position_analyses": selected_analyses,
+                "execution_guidance": [
+                    "优先使用本接口做盘中持仓全局判断，减少GPT逐个接口串行调用。",
+                    "fast模式适合竞价、盘中急用；deep模式适合盘后或需要最近成交明细时使用。",
+                    "如果某只股票需要进一步核验，再单独调用getStockIntradayAnalysis。",
+                ],
+            },
+            source=self.source,
+            freshness=freshness,
+        )
+
     def portfolio_analyze(self, payload: dict[str, Any]) -> dict[str, Any]:
         cash = float(payload.get("cash", 0.0) or 0.0)
         positions = payload.get("positions", []) or []
@@ -3558,6 +3685,10 @@ def create_app(service: MarketDataService | None = None):
     @app.post("/portfolio/analyze")
     def portfolio_analyze(payload: dict[str, Any]):
         return service.portfolio_analyze(payload)
+
+    @app.post("/portfolio/intraday-decision")
+    def portfolio_intraday_decision(payload: dict[str, Any]):
+        return service.portfolio_intraday_decision(payload)
 
     @app.post("/reviews/log")
     def reviews_log(payload: dict[str, Any]):
