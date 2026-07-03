@@ -1075,6 +1075,7 @@ def test_gpt_instructions_define_default_fast_portfolio_analysis() -> None:
     instructions = Path("GPT_STOCK_TRADING_ASSISTANT_V4_2.md").read_text(encoding="utf-8")
     schema_text = Path("chatgpt_action_openapi.yaml").read_text(encoding="utf-8")
 
+    assert len(instructions) <= 7000
     assert "默认两段式分析" in instructions
     assert "先做组合快速总览" in instructions
     assert "自动升级深度分析" in instructions
