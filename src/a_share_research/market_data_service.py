@@ -2917,6 +2917,446 @@ class MarketDataService:
             },
         }
 
+    def _v50_score_from_status(self, status: str, default: float = 50.0) -> float:
+        return {"ok": 75.0, "partial": 55.0, "skipped": 45.0, "failed": 35.0}.get(str(status), default)
+
+    def _v50_probability_label(self, score: float) -> tuple[str, str]:
+        if score >= 70:
+            return "65%-75%", "高"
+        if score >= 62:
+            return "58%-65%", "中"
+        if score >= 50:
+            return "48%-58%", "中"
+        if score >= 42:
+            return "40%-48%", "中"
+        return "40%以下", "低"
+
+    def _v50_sector_position_research(
+        self,
+        board_stock_alignment: dict[str, Any],
+        sector_alignment: dict[str, Any],
+    ) -> dict[str, Any]:
+        status = str(board_stock_alignment.get("status") or "failed")
+        stock_vs_sector = str(board_stock_alignment.get("stock_vs_board") or "不可确认")
+        rank = _nullable_int(board_stock_alignment.get("industry_rank"))
+        industry_change = _nullable_float(board_stock_alignment.get("industry_change_pct"))
+        score = self._v50_score_from_status(status)
+        strengths: list[str] = []
+        weaknesses: list[str] = []
+        if stock_vs_sector == "强于板块":
+            score += 12
+            strengths.append("个股强于所属板块，说明不是单纯被板块拖着走。")
+        elif stock_vs_sector == "同步板块":
+            score += 5
+            strengths.append("个股与板块同步，板块持续时更容易延续。")
+        elif stock_vs_sector == "弱于板块":
+            score -= 12
+            weaknesses.append("个股弱于板块，存在掉队风险。")
+        else:
+            weaknesses.append("板块数据不足，不能确认个股在板块中的真实强弱。")
+        if rank is not None and rank <= 10:
+            score += 6
+            strengths.append("所属板块排名靠前，有顺风环境。")
+        if industry_change is not None and industry_change < 0:
+            score -= 5
+            weaknesses.append("所属板块下跌，短线胜率需要降级。")
+        if status not in {"ok", "partial"}:
+            weaknesses.append("板块数据不足")
+        return {
+            "status": status if status in {"ok", "partial"} else "failed",
+            "must_use_in_reply": True,
+            "industry": board_stock_alignment.get("industry"),
+            "concepts": board_stock_alignment.get("concepts") or [],
+            "industry_change_pct": industry_change,
+            "industry_rank": rank,
+            "stock_vs_sector": stock_vs_sector,
+            "stock_role_estimate": board_stock_alignment.get("stock_role_estimate"),
+            "score": round(max(0.0, min(100.0, score)), 1),
+            "strengths": list(dict.fromkeys(strengths)),
+            "weaknesses": list(dict.fromkeys(weaknesses)),
+            "plain_explanation": sector_alignment.get("conclusion"),
+        }
+
+    def _v50_technical_research(
+        self,
+        professional_technical_diagnosis: dict[str, Any],
+        technical_level_layers: dict[str, Any],
+        moving_average_structure: dict[str, Any],
+        recent_3d_context: dict[str, Any],
+        today_intraday_summary: dict[str, Any],
+        volume_price_relation: dict[str, Any],
+        risk_volatility: dict[str, Any],
+    ) -> dict[str, Any]:
+        structure = moving_average_structure.get("structure")
+        phase = today_intraday_summary.get("phase_pattern")
+        score = 55.0
+        strengths: list[str] = []
+        weaknesses: list[str] = []
+        if structure == "多头排列":
+            score += 15
+            strengths.append("均线多头排列，日线趋势偏强。")
+        elif structure == "空头排列":
+            score -= 15
+            weaknesses.append("均线空头排列，反弹容易遇到压力。")
+        elif structure == "均线纠缠":
+            weaknesses.append("均线纠缠，趋势方向不够清楚。")
+        if "站上均价" in str(phase):
+            score += 8
+            strengths.append("当前分时站上均价，日内结构较强。")
+        elif "低于均价" in str(phase):
+            score -= 8
+            weaknesses.append("当前低于分时均价，短线主动性不足。")
+        relation = str(volume_price_relation.get("relation") or "")
+        if relation == "放量上涨":
+            score += 8
+            strengths.append("近三日量价偏积极。")
+        elif relation == "放量下跌":
+            score -= 8
+            weaknesses.append("近三日出现放量下跌，需要警惕抛压。")
+        if risk_volatility.get("risk_level") == "高":
+            score -= 6
+            weaknesses.append("波动风险偏高，失败线不能放太宽。")
+        return {
+            "status": "ok" if professional_technical_diagnosis.get("key_evidence") else "partial",
+            "level_source_policy": "所有关键点位必须带来源",
+            "setup_type": professional_technical_diagnosis.get("setup_type"),
+            "score": round(max(0.0, min(100.0, score)), 1),
+            "moving_average_structure": structure,
+            "three_day_direction": recent_3d_context.get("direction_3d"),
+            "three_day_volume_trend": recent_3d_context.get("volume_trend_3d"),
+            "intraday_pattern": phase,
+            "volume_price_relation": relation,
+            "risk_level": risk_volatility.get("risk_level"),
+            "key_evidence": professional_technical_diagnosis.get("key_evidence") or [],
+            "level_sources": technical_level_layers,
+            "strengths": list(dict.fromkeys(strengths)),
+            "weaknesses": list(dict.fromkeys(weaknesses)),
+        }
+
+    def _v50_fundamental_research(self, fundamental_diagnosis: dict[str, Any]) -> dict[str, Any]:
+        status = str(fundamental_diagnosis.get("status") or "failed")
+        score = self._v50_score_from_status(status)
+        quality = fundamental_diagnosis.get("quality_factors") if isinstance(fundamental_diagnosis.get("quality_factors"), dict) else {}
+        weaknesses = []
+        if status != "ok":
+            weaknesses.append("财报细项不足，基本面只能作为背景判断。")
+        if quality.get("cash_flow") == "需要财报补充":
+            weaknesses.append("经营现金流缺失，无法判断利润质量。")
+        return {
+            "status": status,
+            "score": round(score, 1),
+            "industry": fundamental_diagnosis.get("industry"),
+            "market_cap_style": fundamental_diagnosis.get("market_cap_style"),
+            "total_market_cap": fundamental_diagnosis.get("total_market_cap"),
+            "quality_factors": quality,
+            "strengths": [],
+            "weaknesses": list(dict.fromkeys(weaknesses)),
+            "usage_note": "基本面决定是否值得做波段或继续占仓；数据不足时不允许编造业绩结论。",
+        }
+
+    def _v50_risk_reward_profile(
+        self,
+        quote: dict[str, Any],
+        technical_level_layers: dict[str, Any],
+        support_resistance_zones: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest = _nullable_float(quote.get("latest_price"))
+        upside_item = technical_level_layers.get("take_profit_reference") or {}
+        downside_item = technical_level_layers.get("hard_stop_line") or {}
+        upside_price = _nullable_float(upside_item.get("price"))
+        downside_price = _nullable_float(downside_item.get("price"))
+        if upside_price is None:
+            resistances = support_resistance_zones.get("resistance_zones") or []
+            upside_item = resistances[0] if resistances else {}
+            upside_price = _nullable_float(upside_item.get("price"))
+        if downside_price is None:
+            supports = support_resistance_zones.get("support_zones") or []
+            downside_item = supports[0] if supports else {}
+            downside_price = _nullable_float(downside_item.get("price"))
+        upside_pct = _pct_change(upside_price, latest)
+        downside_pct = abs(_pct_change(downside_price, latest) or 0) if latest is not None and downside_price is not None else None
+        ratio = round(upside_pct / downside_pct, 2) if upside_pct is not None and downside_pct not in (None, 0) else None
+        if ratio is None:
+            conclusion = "赔率不可确认"
+        elif ratio >= 2:
+            conclusion = "赔率较好"
+        elif ratio >= 1.2:
+            conclusion = "赔率一般"
+        else:
+            conclusion = "赔率偏差"
+        return {
+            "status": "ok" if latest is not None and upside_price is not None and downside_price is not None else "partial",
+            "latest_price": latest,
+            "upside_reference": {
+                "price": upside_price,
+                "source": upside_item.get("source") or upside_item.get("name") or "resistance_zones",
+            },
+            "downside_reference": {
+                "price": downside_price,
+                "source": downside_item.get("source") or downside_item.get("name") or "support_zones",
+            },
+            "upside_pct": upside_pct,
+            "downside_pct": downside_pct,
+            "risk_reward_ratio": ratio,
+            "conclusion": conclusion,
+            "usage_note": "赔率用于判断值不值得承担T+1和隔夜风险，不等于收益承诺。",
+        }
+
+    def _v50_valuation_research(
+        self,
+        fundamental_diagnosis: dict[str, Any],
+        risk_reward_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        valuation = fundamental_diagnosis.get("valuation") if isinstance(fundamental_diagnosis.get("valuation"), dict) else {}
+        pe = _nullable_float(valuation.get("pe"))
+        pb = _nullable_float(valuation.get("pb"))
+        ps = _nullable_float(valuation.get("ps"))
+        known = [value for value in [pe, pb, ps] if value is not None]
+        status = "ok" if known else "partial"
+        score = 60.0 if known else 45.0
+        weaknesses = [] if known else ["实时接口未稳定提供PE/PB/PS，估值结论降级。"]
+        ratio = _nullable_float((risk_reward_profile or {}).get("risk_reward_ratio"))
+        if ratio is not None and ratio >= 2:
+            score += 10
+        elif ratio is not None and ratio < 1.2:
+            score -= 10
+            weaknesses.append("上行空间相对下行风险不够厚。")
+        return {
+            "status": status,
+            "score": round(max(0.0, min(100.0, score)), 1),
+            "pe": pe,
+            "pb": pb,
+            "ps": ps,
+            "valuation_note": valuation.get("note") or "估值数据不足，不能编造便宜或昂贵结论。",
+            "risk_reward_link": (risk_reward_profile or {}).get("conclusion"),
+            "weaknesses": list(dict.fromkeys(weaknesses)),
+        }
+
+    def _v50_event_risk_research(self, data_quality: dict[str, Any], zt_related: dict[str, Any]) -> dict[str, Any]:
+        status = "partial"
+        risks = ["公告、解禁、减持、监管问询等事件需要另行核查；当前接口只提供有限事件线索。"]
+        if zt_related.get("status") == "ok" and zt_related.get("related"):
+            status = "ok"
+            risks.append("涨停池有关联，需检查是否为题材高潮或炸板风险。")
+        if data_quality.get("zt_pool_status") in {"failed", "skipped"}:
+            risks.append("涨停池/事件线索不足，事件风险置信度降低。")
+        return {
+            "status": status,
+            "zt_pool_status": data_quality.get("zt_pool_status"),
+            "related_limit_up": zt_related.get("related") or [],
+            "risks": list(dict.fromkeys(risks)),
+            "usage_note": "事件风险会改变短线概率；缺失时不能假设没有利空或利好。",
+        }
+
+    def _v50_time_horizon_probability(
+        self,
+        decision_score: dict[str, Any],
+        data_quality: dict[str, Any],
+        sector_position_research: dict[str, Any],
+        technical_research: dict[str, Any],
+        fundamental_research: dict[str, Any],
+        valuation_research: dict[str, Any],
+        risk_reward_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        factor_scores = decision_score.get("factor_scores") if isinstance(decision_score.get("factor_scores"), dict) else {}
+        intraday_score = (
+            (float(factor_scores.get("intraday", 0)) / 14 * 35)
+            + (float(factor_scores.get("order_book", 0)) / 10 * 20)
+            + (float(factor_scores.get("market", 0)) / 15 * 15)
+            + (sector_position_research.get("score", 50) * 0.15)
+            + (technical_research.get("score", 50) * 0.15)
+        )
+        three_to_five_score = (
+            technical_research.get("score", 50) * 0.35
+            + sector_position_research.get("score", 50) * 0.25
+            + (float(factor_scores.get("market", 0)) / 15 * 20)
+            + (risk_reward_profile.get("risk_reward_ratio") or 1) * 6
+        )
+        swing_score = (
+            fundamental_research.get("score", 50) * 0.30
+            + valuation_research.get("score", 50) * 0.25
+            + technical_research.get("score", 50) * 0.25
+            + sector_position_research.get("score", 50) * 0.20
+        )
+        if data_quality.get("intraday_status") != "ok":
+            intraday_score = min(intraday_score, 55.0)
+        if data_quality.get("board_status") not in {"ok", "partial"}:
+            intraday_score = min(intraday_score, 58.0)
+            three_to_five_score = min(three_to_five_score, 55.0)
+        if fundamental_research.get("status") != "ok":
+            swing_score = min(swing_score, 55.0)
+
+        def pack(score: float, evidence: list[str], confidence_override: str | None = None) -> dict[str, Any]:
+            band, confidence = self._v50_probability_label(round(max(0.0, min(100.0, score)), 1))
+            return {
+                "score": round(max(0.0, min(100.0, score)), 1),
+                "probability_band": band,
+                "confidence": confidence_override or confidence,
+                "evidence": evidence,
+                "note": "概率是基于当前数据的研究区间，不是收益承诺。",
+            }
+
+        swing_confidence = "低" if fundamental_research.get("status") != "ok" or valuation_research.get("status") != "ok" else None
+        return {
+            "intraday_next_session": pack(
+                intraday_score,
+                ["分时/盘口", "市场环境", "板块相对强弱"],
+                "低" if data_quality.get("intraday_status") != "ok" else None,
+            ),
+            "three_to_five_days": pack(
+                three_to_five_score,
+                ["三日结构", "技术结构", "板块持续性", "赔率"],
+            ),
+            "two_to_six_weeks": pack(
+                swing_score,
+                ["日线结构", "基本面", "估值", "行业逻辑"],
+                swing_confidence,
+            ),
+        }
+
+    def _v50_operation_plan(
+        self,
+        quote: dict[str, Any],
+        position_risk_contribution: dict[str, Any],
+        technical_level_layers: dict[str, Any],
+        time_horizon_probability: dict[str, Any],
+        risk_reward_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        shares = int(position_risk_contribution.get("shares") or 0)
+        available = int(position_risk_contribution.get("available") or 0)
+        latest = _nullable_float(quote.get("latest_price"))
+        strength_line = technical_level_layers.get("intraday_strength_line", {}).get("price")
+        hard_stop = technical_level_layers.get("hard_stop_line", {}).get("price")
+        take_profit = risk_reward_profile.get("upside_reference", {}).get("price")
+        if shares > 0:
+            existing = (
+                f"已有{shares}股，可卖{available}股。先看能否站稳强弱线{strength_line}；"
+                f"若跌破失败线{hard_stop}且5-10分钟收不回，可卖部分优先降风险。"
+            )
+            if available == 0:
+                existing += " 当前可卖为0，今天不能给卖出执行，只能制定明日处理线。"
+        else:
+            existing = "当前不是持仓股，重点看是否值得新开仓，不需要处理已有仓位。"
+        no_position = (
+            f"无仓时不要只因现价{latest}就追；只有站稳分时强弱线{strength_line}，"
+            f"且赔率目标{take_profit}相对失败线{hard_stop}足够厚，才考虑小仓。"
+        )
+        return {
+            "existing_position_plan": existing,
+            "no_position_plan": no_position,
+            "today_vs_next_session": "available=0只做明日预案；available>0才可讨论今天执行。",
+            "probability_reference": time_horizon_probability,
+        }
+
+    def _v50_invalidation_conditions(
+        self,
+        technical_level_layers: dict[str, Any],
+        sector_position_research: dict[str, Any],
+        data_quality: dict[str, Any],
+    ) -> dict[str, Any]:
+        hard_stop = technical_level_layers.get("hard_stop_line", {})
+        turn_strong = technical_level_layers.get("turn_strong_line", {})
+        data_quality_notes = []
+        if data_quality.get("intraday_status") != "ok":
+            data_quality_notes.append("分时数据缺失")
+        if data_quality.get("board_status") not in {"ok", "partial"}:
+            data_quality_notes.append("板块数据不足")
+        return {
+            "technical": [
+                f"跌破{hard_stop.get('price')}且5-10分钟收不回，来源：{hard_stop.get('source')}",
+                f"不能突破或站稳{turn_strong.get('price')}，说明强修复失败，来源：{turn_strong.get('source')}",
+            ],
+            "sector": [
+                "所属板块转弱或个股由强于/同步板块变成弱于板块时，结论降级。",
+                f"当前板块弱点：{'；'.join(sector_position_research.get('weaknesses') or ['暂无明确弱点'])}",
+            ],
+            "data_quality": data_quality_notes or ["关键数据基本可用"],
+        }
+
+    def _v50_final_research_score(
+        self,
+        technical_research: dict[str, Any],
+        sector_position_research: dict[str, Any],
+        fundamental_research: dict[str, Any],
+        valuation_research: dict[str, Any],
+        time_horizon_probability: dict[str, Any],
+        risk_reward_profile: dict[str, Any],
+        data_quality: dict[str, Any],
+    ) -> dict[str, Any]:
+        technical_score = float(technical_research.get("score") or 50.0)
+        sector_score = float(sector_position_research.get("score") or 50.0)
+        fundamental_score = float(fundamental_research.get("score") or 50.0)
+        valuation_score = float(valuation_research.get("score") or 50.0)
+        risk_reward_ratio = _nullable_float(risk_reward_profile.get("risk_reward_ratio"))
+        risk_reward_score = 70.0 if risk_reward_ratio is not None and risk_reward_ratio >= 2 else 55.0 if risk_reward_ratio is not None and risk_reward_ratio >= 1.2 else 42.0
+        data_quality_score = sum(
+            self._v50_score_from_status(str(data_quality.get(key)))
+            for key in ["quote_status", "intraday_status", "board_status", "technical_status"]
+        ) / 4
+        overall = (
+            technical_score * 0.28
+            + sector_score * 0.22
+            + fundamental_score * 0.18
+            + valuation_score * 0.12
+            + risk_reward_score * 0.12
+            + data_quality_score * 0.08
+        )
+        band, confidence = self._v50_probability_label(overall)
+        return {
+            "overall_score": round(max(0.0, min(100.0, overall)), 1),
+            "overall_probability_band": band,
+            "confidence": confidence,
+            "score_components": {
+                "technical_score": round(technical_score, 1),
+                "sector_score": round(sector_score, 1),
+                "fundamental_score": round(fundamental_score, 1),
+                "valuation_score": round(valuation_score, 1),
+                "risk_reward_score": round(risk_reward_score, 1),
+                "data_quality_score": round(data_quality_score, 1),
+            },
+            "horizon_summary": time_horizon_probability,
+            "usage_note": "综合分用于组织研究结论，不是自动交易信号。",
+        }
+
+    def _v50_research_summary(
+        self,
+        quote: dict[str, Any],
+        data_quality: dict[str, Any],
+        final_research_score: dict[str, Any],
+        time_horizon_probability: dict[str, Any],
+    ) -> dict[str, Any]:
+        score = _nullable_float(final_research_score.get("overall_score")) or 0
+        if score >= 70:
+            label = "强势可持"
+        elif score >= 60:
+            label = "修复观察"
+        elif score >= 50:
+            label = "条件买入/持有观察"
+        elif score >= 42:
+            label = "不适合加仓"
+        else:
+            label = "风险优先"
+        return {
+            "research_version": "V5.0",
+            "default_workflow": "单股深度研究，不默认选股",
+            "code": quote.get("code"),
+            "name": quote.get("name"),
+            "one_line_conclusion": label,
+            "overall_score": final_research_score.get("overall_score"),
+            "overall_probability_band": final_research_score.get("overall_probability_band"),
+            "data_quality_summary": {
+                "quote": data_quality.get("quote_status"),
+                "intraday": data_quality.get("intraday_status"),
+                "board": data_quality.get("board_status"),
+                "technical": data_quality.get("technical_status"),
+            },
+            "horizon_headline": {
+                key: value.get("probability_band")
+                for key, value in time_horizon_probability.items()
+                if isinstance(value, dict)
+            },
+        }
+
     def _position_risk_contribution(self, quote: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
         positions = account.get("positions") if isinstance(account.get("positions"), list) else []
         matched = next((item for item in positions if normalize_code(item.get("code", "")) == normalize_code(quote.get("code", ""))), {})
@@ -3275,6 +3715,56 @@ class MarketDataService:
             technical_level_layers=technical_level_layers,
             position_risk_contribution=position_risk_contribution,
         )
+        sector_position_research = self._v50_sector_position_research(board_stock_alignment, sector_alignment)
+        technical_research = self._v50_technical_research(
+            professional_technical_diagnosis,
+            technical_level_layers,
+            moving_average_structure,
+            recent_3d_context,
+            today_intraday_summary,
+            volume_price_relation,
+            risk_volatility,
+        )
+        fundamental_research = self._v50_fundamental_research(fundamental_diagnosis)
+        risk_reward_profile = self._v50_risk_reward_profile(quote, technical_level_layers, support_resistance_zones)
+        valuation_research = self._v50_valuation_research(fundamental_diagnosis, risk_reward_profile)
+        event_risk_research = self._v50_event_risk_research(data_quality, zt_related)
+        time_horizon_probability = self._v50_time_horizon_probability(
+            decision_score,
+            data_quality,
+            sector_position_research,
+            technical_research,
+            fundamental_research,
+            valuation_research,
+            risk_reward_profile,
+        )
+        operation_plan_v50 = self._v50_operation_plan(
+            quote,
+            position_risk_contribution,
+            technical_level_layers,
+            time_horizon_probability,
+            risk_reward_profile,
+        )
+        invalidation_conditions = self._v50_invalidation_conditions(
+            technical_level_layers,
+            sector_position_research,
+            data_quality,
+        )
+        final_research_score = self._v50_final_research_score(
+            technical_research,
+            sector_position_research,
+            fundamental_research,
+            valuation_research,
+            time_horizon_probability,
+            risk_reward_profile,
+            data_quality,
+        )
+        v50_research_summary = self._v50_research_summary(
+            quote,
+            data_quality,
+            final_research_score,
+            time_horizon_probability,
+        )
         review_log_receipt = self._review_log_receipt()
         review_record = self._review_record(
             code=code,
@@ -3323,6 +3813,17 @@ class MarketDataService:
                 "technical_level_layers": technical_level_layers,
                 "next_session_scenarios": next_session_scenarios,
                 "professional_scenario_plan": professional_scenario_plan,
+                "v50_research_summary": v50_research_summary,
+                "time_horizon_probability": time_horizon_probability,
+                "risk_reward_profile": risk_reward_profile,
+                "fundamental_research": fundamental_research,
+                "valuation_research": valuation_research,
+                "event_risk_research": event_risk_research,
+                "sector_position_research": sector_position_research,
+                "technical_research": technical_research,
+                "operation_plan_v50": operation_plan_v50,
+                "invalidation_conditions": invalidation_conditions,
+                "final_research_score": final_research_score,
                 "review_log_receipt": review_log_receipt,
                 "response_completeness_check": response_completeness_check,
                 "execution_checklist": execution_checklist,

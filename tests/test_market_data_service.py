@@ -805,6 +805,123 @@ def test_stock_intraday_analysis_returns_professional_diagnosis_sections() -> No
     assert set(out["professional_scenario_plan"]) == {"upside", "base", "downside"}
 
 
+def test_stock_intraday_analysis_returns_v50_deep_research_sections() -> None:
+    hist_df = pd.DataFrame(
+        {
+            "日期": [f"2026-06-{day:02d}" for day in range(1, 31)] + [f"2026-07-{day:02d}" for day in range(1, 31)],
+            "开盘": [7.0 + i * 0.03 for i in range(60)],
+            "最高": [7.2 + i * 0.03 for i in range(60)],
+            "最低": [6.8 + i * 0.03 for i in range(60)],
+            "收盘": [7.0 + i * 0.03 for i in range(60)],
+            "成交量": [100000 + i * 2000 for i in range(60)],
+        }
+    )
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame(
+            [
+                {
+                    "代码": "002100",
+                    "名称": "天康生物",
+                    "最新价": 8.76,
+                    "涨跌幅": 1.8,
+                    "今开": 8.6,
+                    "最高": 8.9,
+                    "最低": 8.55,
+                    "换手率": 4.5,
+                    "量比": 1.4,
+                    "总市值": 12000000000,
+                    "流通市值": 9000000000,
+                }
+            ]
+        ),
+        indices=pd.DataFrame([{"代码": "000001", "名称": "上证指数", "最新价": 3200.0, "涨跌幅": 0.5}]),
+        boards_df=pd.DataFrame(
+            [
+                {
+                    "board_type": "行业",
+                    "board_name": "农牧饲渔",
+                    "change_pct": 2.8,
+                    "rank": 6,
+                    "up_ratio": 0.72,
+                    "main_net_inflow": 120000000,
+                    "leader_code": "002100",
+                    "leader": "天康生物",
+                    "leader_change_pct": 4.2,
+                    "limit_up_count": 2,
+                }
+            ]
+        ),
+        bidasks={
+            "002100": pd.DataFrame(
+                [
+                    {"item": "最新", "value": 8.76},
+                    {"item": "涨幅", "value": 1.8},
+                    {"item": "buy_1", "value": 8.76},
+                    {"item": "buy_1_vol", "value": 12000},
+                    {"item": "sell_1", "value": 8.77},
+                    {"item": "sell_1_vol", "value": 9000},
+                ]
+            )
+        },
+        hist={"002100": hist_df},
+        intraday={
+            "002100": pd.DataFrame(
+                [
+                    {"time": "09:31", "close": 8.6, "avg_price": 8.58, "volume": 10000, "amount": 86000},
+                    {"time": "10:00", "close": 8.76, "avg_price": 8.68, "volume": 18000, "amount": 157680},
+                ]
+            )
+        },
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis(
+        {
+            "code": "002100",
+            "account": {
+                "cash": 5000,
+                "total_asset": 12000,
+                "positions": [{"code": "002100", "shares": 100, "available": 100, "cost": 8.5}],
+            },
+        }
+    )
+
+    assert out["v50_research_summary"]["research_version"] == "V5.0"
+    assert out["v50_research_summary"]["default_workflow"] == "单股深度研究，不默认选股"
+    assert out["sector_position_research"]["must_use_in_reply"] is True
+    assert out["sector_position_research"]["stock_vs_sector"] in {"强于板块", "同步板块", "弱于板块", "不可确认"}
+    assert out["technical_research"]["level_source_policy"] == "所有关键点位必须带来源"
+    assert set(out["time_horizon_probability"]) == {"intraday_next_session", "three_to_five_days", "two_to_six_weeks"}
+    assert out["time_horizon_probability"]["intraday_next_session"]["probability_band"]
+    assert out["time_horizon_probability"]["two_to_six_weeks"]["confidence"] in {"高", "中", "低"}
+    assert out["risk_reward_profile"]["risk_reward_ratio"] is not None
+    assert out["risk_reward_profile"]["upside_reference"]["source"]
+    assert out["risk_reward_profile"]["downside_reference"]["source"]
+    assert out["fundamental_research"]["status"] in {"ok", "partial", "failed"}
+    assert out["valuation_research"]["status"] in {"ok", "partial", "failed"}
+    assert out["event_risk_research"]["status"] in {"ok", "partial", "failed"}
+    assert out["operation_plan_v50"]["existing_position_plan"]
+    assert out["operation_plan_v50"]["no_position_plan"]
+    assert out["invalidation_conditions"]["technical"]
+    assert out["final_research_score"]["overall_score"] is not None
+    assert out["final_research_score"]["score_components"]["sector_score"] is not None
+
+
+def test_v50_deep_research_degrades_when_intraday_or_sector_missing() -> None:
+    provider = StaticMarketDataProvider(
+        quotes=pd.DataFrame([{"代码": "002100", "名称": "天康生物", "最新价": 8.76, "涨跌幅": 1.0}]),
+        hist={"002100": pd.DataFrame({"收盘": [5 + i * 0.05 for i in range(80)]})},
+    )
+
+    out = MarketDataService(provider=provider).stock_intraday_analysis({"code": "002100"})
+
+    assert out["data_quality"]["intraday_status"] == "failed"
+    assert out["sector_position_research"]["status"] in {"partial", "failed"}
+    assert out["time_horizon_probability"]["intraday_next_session"]["probability_band"] in {"48%-58%", "40%-48%", "40%以下"}
+    assert out["time_horizon_probability"]["two_to_six_weeks"]["confidence"] == "低"
+    assert "分时数据缺失" in out["invalidation_conditions"]["data_quality"]
+    assert "板块数据不足" in out["sector_position_research"]["weaknesses"]
+
+
 def test_verify_candidates_marks_repeated_names_as_tracking_not_new_recommendations() -> None:
     class CandidateProvider(StaticMarketDataProvider):
         def quotes(self) -> pd.DataFrame:
@@ -1413,16 +1530,28 @@ def test_openapi_marks_read_only_actions_as_non_consequential() -> None:
         assert "x-openai-isConsequential: false" in section
 
 
-def test_gpt_instructions_define_default_fast_portfolio_analysis() -> None:
+def test_openapi_describes_v50_single_stock_research_default() -> None:
+    text = Path("chatgpt_action_openapi.yaml").read_text(encoding="utf-8")
+
+    assert "V5单股深度研究" in text
+    assert "不再默认选股" in text
+    assert "time_horizon_probability" in text
+    assert "risk_reward_profile" in text
+    assert "候选工具只在用户明确要求选股时使用" in text
+
+
+def test_v50_gpt_instruction_defaults_to_single_stock_deep_research() -> None:
     instructions = Path("GPT_STOCK_TRADING_ASSISTANT_V4_2.md").read_text(encoding="utf-8")
-    schema_text = Path("chatgpt_action_openapi.yaml").read_text(encoding="utf-8")
 
     assert len(instructions) <= 7000
-    assert "默认两段式分析" in instructions
-    assert "先做组合快速总览" in instructions
-    assert "自动升级深度分析" in instructions
-    assert "组合快速分析" in schema_text
-    assert "需要盘中全面分析时，应在快速总览后升级深度分析" in schema_text
+    assert "V5 单股深度研究版" in instructions
+    assert "不再默认选股" in instructions
+    assert "getStockIntradayAnalysis" in instructions
+    assert "盈利概率" in instructions
+    assert "日内/次日" in instructions
+    assert "3-5个交易日" in instructions
+    assert "2-6周波段" in instructions
+    assert "候选股工具只在用户明确要求选股时使用" in instructions
 
 
 def test_privacy_endpoint_returns_plain_policy_page() -> None:
