@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: A Share Market Data Service
   version: 0.2.0
-  description: 获取A股实时大盘、个股报价、盘口、板块、技术点位、三日走势、分时结构、板块匹配、账户约束、持仓分析数据和轻量复盘记忆。
+  description: V5单股深度研究数据服务：获取A股实时大盘、个股报价、盘口、板块、技术点位、三日走势、分时结构、基本面/估值占位、赔率、分周期盈利概率、账户约束和轻量复盘记忆；不再默认选股。
 servers:
   - url: https://a-share-market-data-service.onrender.com
     description: Render deployment
@@ -83,8 +83,8 @@ paths:
     post:
       operationId: getStockIntradayAnalysis
       x-openai-isConsequential: false
-      summary: 获取单只股票盘中交易分析数据结构
-      description: 聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、最近三日走势、当日分时总结、K线结构、均线结构、量价关系、相对强弱、支撑压力区、风险波动、盘口解释、板块-个股匹配、市场状态、涨停池关联、账户约束、偏进攻交易评分、交易计划、技术解读包、回答完整性检查、执行检查清单、明日三情景和复盘记录，用于盘中买卖点判断。
+      summary: V5单股深度研究：盈利概率、赔率和风险分析
+      description: 默认单股研究入口。聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、最近三日走势、当日分时总结、K线结构、均线结构、量价关系、相对强弱、支撑压力区、风险波动、盘口解释、板块-个股匹配、市场状态、涨停池关联、账户约束和复盘记录；返回V5单股深度研究字段，包括time_horizon_probability、risk_reward_profile、fundamental_research、valuation_research、event_risk_research、sector_position_research、technical_research、operation_plan_v50、invalidation_conditions和final_research_score，用于回答这只股票当前价格下短线/波段盈利概率、赔率和风险。
       requestBody:
         required: true
         content:
@@ -139,12 +139,13 @@ paths:
                 - code
       responses:
         "200":
-          description: 单票盘中交易分析用完整数据结构。GPT必须重点使用 trade_setup_type、professional_technical_diagnosis、fundamental_diagnosis、sector_alignment、professional_scenario_plan、recent_3d_context、today_intraday_summary、support_resistance_zones、order_book_interpretation、board_stock_alignment、position_risk_contribution、technical_level_layers、next_session_scenarios、decision_score、trading_plan、technical_interpretation、response_completeness_check、execution_checklist、review_log_receipt和review_record。
+          description: V5单股深度研究完整数据结构。GPT必须优先使用v50_research_summary、time_horizon_probability、risk_reward_profile、fundamental_research、valuation_research、event_risk_research、sector_position_research、technical_research、operation_plan_v50、invalidation_conditions和final_research_score，同时结合trade_setup_type、professional_technical_diagnosis、recent_3d_context、today_intraday_summary、support_resistance_zones、order_book_interpretation、position_risk_contribution和review_record。
   /candidates/actionable:
     get:
       operationId: getActionableCandidates
       x-openai-isConsequential: false
-      summary: 获取可执行候选股
+      summary: 明确要求选股时获取可执行候选股
+      description: 候选工具只在用户明确要求选股时使用；V5默认工作流是不再默认选股，而是先分析用户指定的单只股票。返回的buy_now/candidates只表示可执行，不等于推荐。
       parameters:
         - name: cash
           in: query
@@ -171,13 +172,13 @@ paths:
           description: 近期已推荐或重点观察过的股票代码，逗号分隔；这些股票默认降级到观察池，避免重复推荐
       responses:
         "200":
-          description: 返回 V4.5 机会漏斗候选。buy_now/candidates 只表示盘口和现金可执行，不等于推荐；recommendation_tier 才决定强推荐可买/小仓试错/条件观察/剔除。GPT 必须优先使用 market_gate、sector_gate、stock_role、entry_setup、account_gate、opportunity_source、risk_reward_ratio、downgrade_reasons、opportunity_pools、strong_buy、trial_buy、conditional_buy、rejected，不得只按技术分或买点距离推荐。
+          description: 返回候选机会漏斗。候选工具只在用户明确要求选股时使用；buy_now/candidates只表示盘口和现金可执行，不等于推荐；recommendation_tier才决定强推荐可买/小仓试错/条件观察/剔除。
   /candidates/verify:
     post:
       operationId: verifyCandidates
       x-openai-isConsequential: false
       summary: 核验由ChatGPT或用户提供的候选股票
-      description: 对候选股票逐只核验实时价格、盘口可执行性、技术点位、现金约束、主板范围、追高风险和候选生命周期，用于判断是否值得推荐，并避免重复推荐老股票。
+      description: 候选工具只在用户明确要求选股时使用。对候选股票逐只核验实时价格、盘口可执行性、技术点位、现金约束、主板范围、追高风险和候选生命周期，用于明确选股场景；普通单股问题应优先使用getStockIntradayAnalysis。
       requestBody:
         required: true
         content:
