@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 from src.a_share_research.market_data_service import (
     AkshareMarketDataProvider,
@@ -1538,6 +1539,18 @@ def test_openapi_describes_v50_single_stock_research_default() -> None:
     assert "time_horizon_probability" in text
     assert "risk_reward_profile" in text
     assert "候选工具只在用户明确要求选股时使用" in text
+
+
+def test_openapi_operation_descriptions_fit_chatgpt_limit() -> None:
+    schema = yaml.safe_load(Path("chatgpt_action_openapi.yaml").read_text(encoding="utf-8"))
+
+    too_long = []
+    for path, methods in schema["paths"].items():
+        for method, spec in methods.items():
+            description = spec.get("description")
+            if isinstance(description, str) and len(description) > 300:
+                too_long.append((path, method, spec.get("operationId"), len(description)))
+    assert too_long == []
 
 
 def test_v50_gpt_instruction_defaults_to_single_stock_deep_research() -> None:

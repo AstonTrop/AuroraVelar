@@ -84,7 +84,7 @@ paths:
       operationId: getStockIntradayAnalysis
       x-openai-isConsequential: false
       summary: V5单股深度研究：盈利概率、赔率和风险分析
-      description: 默认单股研究入口。聚合实时基础行情、1分钟分时、五档盘口、最近成交、日K技术指标、最近三日走势、当日分时总结、K线结构、均线结构、量价关系、相对强弱、支撑压力区、风险波动、盘口解释、板块-个股匹配、市场状态、涨停池关联、账户约束和复盘记录；返回V5单股深度研究字段，包括time_horizon_probability、risk_reward_profile、fundamental_research、valuation_research、event_risk_research、sector_position_research、technical_research、operation_plan_v50、invalidation_conditions和final_research_score，用于回答这只股票当前价格下短线/波段盈利概率、赔率和风险。
+      description: 默认单股研究入口；不再默认选股。返回V5单股深度研究字段：分周期盈利概率、赔率、技术、板块、基本面、估值、事件风险、账户约束、操作计划和反证条件。
       requestBody:
         required: true
         content:
@@ -139,7 +139,7 @@ paths:
                 - code
       responses:
         "200":
-          description: V5单股深度研究完整数据结构。GPT必须优先使用v50_research_summary、time_horizon_probability、risk_reward_profile、fundamental_research、valuation_research、event_risk_research、sector_position_research、technical_research、operation_plan_v50、invalidation_conditions和final_research_score，同时结合trade_setup_type、professional_technical_diagnosis、recent_3d_context、today_intraday_summary、support_resistance_zones、order_book_interpretation、position_risk_contribution和review_record。
+          description: V5单股深度研究数据。优先使用v50_research_summary、time_horizon_probability、risk_reward_profile、sector_position_research、technical_research、fundamental_research、operation_plan_v50和final_research_score。
   /candidates/actionable:
     get:
       operationId: getActionableCandidates
